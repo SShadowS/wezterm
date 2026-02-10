@@ -706,10 +706,16 @@ impl super::TermWindow {
                 }
                 column = column.saturating_sub(pos.left);
                 row = row.saturating_sub(pos.top as i64);
+                if pos.pane.get_header().is_some() {
+                    row = row.saturating_sub(1);
+                }
                 break;
             } else if is_already_captured && pane.pane_id() == pos.pane.pane_id() {
                 column = column.saturating_sub(pos.left);
                 row = row.saturating_sub(pos.top as i64).max(0);
+                if pos.pane.get_header().is_some() {
+                    row = row.saturating_sub(1);
+                }
 
                 if position.column < pos.left {
                     x_pixel_offset -= self.render_metrics.cell_size.width
