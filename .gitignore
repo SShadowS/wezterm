@@ -61,6 +61,10 @@ dhat-heap.json
 /wezterm.rb
 /perf.data*
 .idea/
+.claude/
+.serena/
+CLAUDE.md
+/window.md
 /winget-pkgs
 /assets/flatpak/generated-sources.json
 /__pycache__/
