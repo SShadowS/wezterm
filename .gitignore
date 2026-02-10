@@ -65,6 +65,7 @@ dhat-heap.json
 .serena/
 CLAUDE.md
 /window.md
+/build-and-deploy.sh
 /winget-pkgs
 /assets/flatpak/generated-sources.json
 /__pycache__/
