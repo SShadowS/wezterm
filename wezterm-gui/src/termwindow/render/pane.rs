@@ -10,6 +10,7 @@ use ::window::bitmaps::TextureRect;
 use ::window::DeadKeyStatus;
 use anyhow::Context;
 use config::VisualBellTarget;
+use mlua::FromLua;
 use mux::pane::{PaneId, WithPaneLines};
 use mux::renderable::{RenderableDimensions, StableCursorPosition};
 use mux::tab::PositionedPane;
@@ -17,7 +18,7 @@ use ordered_float::NotNan;
 use std::time::Instant;
 use wezterm_dynamic::Value;
 use wezterm_term::color::{ColorAttribute, ColorPalette};
-use wezterm_term::{Line, StableRowIndex};
+use wezterm_term::{CellAttributes, Line, StableRowIndex};
 use window::color::LinearRgba;
 
 impl crate::TermWindow {
@@ -302,6 +303,104 @@ impl crate::TermWindow {
         let cursor_is_default_color =
             palette.cursor_fg == global_cursor_fg && palette.cursor_bg == global_cursor_bg;
 
+        // Render pane header if one is set
+        let header_top_offset = if let Some(header_text) = pos.pane.get_header() {
+            let header_text =
+                self.call_format_pane_header(pos, &header_text, &config);
+
+            let (header_fg_rgba, header_bg_rgba) = if pos.is_active {
+                (
+                    config.pane_header_active_fg_color,
+                    config.pane_header_active_bg_color,
+                )
+            } else {
+                (
+                    config.pane_header_inactive_fg_color,
+                    config.pane_header_inactive_bg_color,
+                )
+            };
+            let header_fg_linear = header_fg_rgba.to_linear();
+            let header_bg_linear = header_bg_rgba.to_linear();
+
+            let left_pixel_x = padding_left
+                + border.left.get() as f32
+                + (pos.left as f32 * cell_width);
+            let header_y =
+                top_pixel_y + (pos.top as f32 * cell_height);
+
+            // Draw header background
+            self.filled_rectangle(
+                layers,
+                0,
+                euclid::rect(
+                    left_pixel_x,
+                    header_y,
+                    pos.width as f32 * cell_width,
+                    cell_height,
+                ),
+                header_bg_linear,
+            )
+            .context("header filled_rectangle")?;
+
+            // Construct and render header text line
+            let header_line =
+                crate::tabbar::parse_status_text(&header_text, CellAttributes::default());
+
+            let mut header_palette = palette.clone();
+            header_palette.foreground = header_fg_rgba.into();
+            header_palette.background = header_bg_rgba.into();
+
+            self.render_screen_line(
+                RenderScreenLineParams {
+                    top_pixel_y: header_y,
+                    left_pixel_x,
+                    pixel_width: pos.width as f32 * cell_width,
+                    stable_line_idx: None,
+                    line: &header_line,
+                    selection: 0..0,
+                    cursor: &Default::default(),
+                    palette: &header_palette,
+                    dims: &RenderableDimensions {
+                        cols: pos.width,
+                        physical_top: 0,
+                        scrollback_rows: 0,
+                        scrollback_top: 0,
+                        viewport_rows: 1,
+                        dpi: self.terminal_size.dpi,
+                        pixel_height: cell_height as usize,
+                        pixel_width: (pos.width as f32 * cell_width) as usize,
+                        reverse_video: false,
+                    },
+                    config: &config,
+                    cursor_border_color: LinearRgba::default(),
+                    foreground: header_fg_linear,
+                    pane: None,
+                    is_active: true,
+                    selection_fg: LinearRgba::default(),
+                    selection_bg: LinearRgba::default(),
+                    cursor_fg: LinearRgba::default(),
+                    cursor_bg: LinearRgba::default(),
+                    cursor_is_default_color: true,
+                    white_space,
+                    filled_box,
+                    window_is_transparent,
+                    default_bg: header_bg_linear,
+                    style: None,
+                    font: None,
+                    use_pixel_positioning: self.config.experimental_pixel_positioning,
+                    render_metrics: self.render_metrics,
+                    shape_key: None,
+                    password_input: false,
+                },
+                layers,
+            )
+            .context("render pane header line")?;
+
+            cell_height
+        } else {
+            0.0
+        };
+
         {
             let stable_range = match current_viewport {
                 Some(top) => top..top + dims.viewport_rows as StableRowIndex,
@@ -346,7 +445,7 @@ impl crate::TermWindow {
                 selrange,
                 rectangular,
                 dims,
-                top_pixel_y,
+                top_pixel_y: top_pixel_y + header_top_offset,
                 left_pixel_x,
                 pos,
                 pane_id,
@@ -580,6 +679,50 @@ impl crate::TermWindow {
         log::trace!("lines elapsed {:?}", start.elapsed());
 
         Ok(())
+    }
+
+    fn call_format_pane_header(
+        &mut self,
+        pos: &PositionedPane,
+        header_text: &str,
+        config: &config::ConfigHandle,
+    ) -> String {
+        let pane_info = Self::pos_pane_to_pane_info(pos);
+
+        match config::run_immediate_with_lua_config(|lua| {
+            if let Some(lua) = lua {
+                let v = config::lua::emit_sync_callback(
+                    &*lua,
+                    (
+                        "format-pane-header".to_string(),
+                        (pane_info.clone(), (**config).clone()),
+                    ),
+                )?;
+                match &v {
+                    mlua::Value::Nil => Ok(None),
+                    mlua::Value::Table(_) => {
+                        let items =
+                            <Vec<termwiz_funcs::FormatItem>>::from_lua(v, &*lua)?;
+                        let esc =
+                            termwiz_funcs::format_as_escapes(items)?;
+                        Ok(Some(esc))
+                    }
+                    _ => {
+                        let s = String::from_lua(v, &*lua)?;
+                        Ok(Some(s))
+                    }
+                }
+            } else {
+                Ok(None)
+            }
+        }) {
+            Ok(Some(s)) => s,
+            Ok(None) => header_text.to_string(),
+            Err(err) => {
+                log::warn!("format-pane-header: {}", err);
+                header_text.to_string()
+            }
+        }
     }
 
     pub fn build_pane(&mut self, pos: &PositionedPane) -> anyhow::Result<ComputedElement> {

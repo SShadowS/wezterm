@@ -272,6 +272,7 @@ pub struct PaneInformation {
     pub title: String,
     pub user_vars: HashMap<String, String>,
     pub progress: Progress,
+    pub header: Option<String>,
 }
 
 impl UserData for PaneInformation {
@@ -290,6 +291,7 @@ impl UserData for PaneInformation {
         fields.add_field_method_get("progress", |lua, this| lua.to_value(&this.progress));
         fields.add_field_method_get("title", |_, this| Ok(this.title.clone()));
         fields.add_field_method_get("user_vars", |_, this| Ok(this.user_vars.clone()));
+        fields.add_field_method_get("header", |_, this| Ok(this.header.clone()));
         fields.add_field_method_get("foreground_process_name", |_, this| {
             let mut name = None;
             if let Some(mux) = Mux::try_get() {
@@ -3451,6 +3453,7 @@ impl TermWindow {
             title: pos.pane.get_title(),
             user_vars: pos.pane.copy_user_vars(),
             progress: pos.pane.get_progress(),
+            header: pos.pane.get_header(),
         }
     }
 

@@ -133,6 +133,7 @@ pub struct LocalPane {
     #[cfg(unix)]
     leader: Arc<Mutex<Option<CachedLeaderInfo>>>,
     command_description: String,
+    header: Mutex<Option<String>>,
 }
 
 #[async_trait(?Send)]
@@ -823,6 +824,14 @@ impl Pane for LocalPane {
 
         Ok(results)
     }
+
+    fn get_header(&self) -> Option<String> {
+        self.header.lock().clone()
+    }
+
+    fn set_header(&self, header: Option<String>) {
+        *self.header.lock() = header;
+    }
 }
 
 struct LocalPaneDCSHandler {
@@ -1019,6 +1028,7 @@ impl LocalPane {
             #[cfg(unix)]
             leader: Arc::new(Mutex::new(None)),
             command_description,
+            header: Mutex::new(None),
         }
     }
 

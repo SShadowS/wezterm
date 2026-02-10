@@ -49,6 +49,7 @@ pub struct ClientPane {
     config: Mutex<Option<Arc<dyn TerminalConfiguration>>>,
     unseen_output: Mutex<bool>,
     progress: Mutex<Progress>,
+    header: Mutex<Option<String>>,
 }
 
 impl ClientPane {
@@ -131,6 +132,7 @@ impl ClientPane {
             user_vars: Mutex::new(HashMap::new()),
             config: Mutex::new(None),
             progress: Mutex::new(Progress::default()),
+            header: Mutex::new(None),
         }
     }
 
@@ -638,6 +640,14 @@ impl Pane for ClientPane {
 
     fn get_config(&self) -> Option<Arc<dyn TerminalConfiguration>> {
         self.config.lock().clone()
+    }
+
+    fn get_header(&self) -> Option<String> {
+        self.header.lock().clone()
+    }
+
+    fn set_header(&self, header: Option<String>) {
+        *self.header.lock() = header;
     }
 }
 

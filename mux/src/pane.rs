@@ -336,6 +336,16 @@ pub trait Pane: Downcast + Send + Sync {
     fn exit_behavior(&self) -> Option<ExitBehavior> {
         None
     }
+
+    /// Returns the user-set header label for this pane, if any.
+    /// When a header is set, the pane renders a header bar at the top
+    /// and the terminal area shrinks by one row.
+    fn get_header(&self) -> Option<String> {
+        None
+    }
+
+    /// Sets or clears the user-set header label for this pane.
+    fn set_header(&self, _header: Option<String>) {}
 }
 impl_downcast!(Pane);
 

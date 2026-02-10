@@ -146,6 +146,35 @@ impl UserData for MuxPane {
             Ok(pane.get_title())
         });
 
+        methods.add_method("get_header", |_, this, _: ()| {
+            let mux = get_mux()?;
+            let pane = this.resolve(&mux)?;
+            Ok(pane.get_header())
+        });
+
+        methods.add_method("set_header", |_, this, header: Option<String>| {
+            let mux = get_mux()?;
+            let pane = this.resolve(&mux)?;
+            let had_header = pane.get_header().is_some();
+            let has_header = header.is_some();
+            pane.set_header(header);
+
+            // If header visibility changed, trigger a resize so the
+            // terminal row count adjusts for the header row
+            if had_header != has_header {
+                if let Some((_domain_id, _window_id, tab_id)) = mux.resolve_pane_id(this.0) {
+                    if let Some(tab) = mux.get_tab(tab_id) {
+                        tab.resize(tab.get_size());
+                    }
+                }
+            }
+
+            // Always notify so the GUI repaints the header (even if
+            // only the text changed, not the visibility)
+            mux.notify(mux::MuxNotification::PaneOutput(this.0));
+            Ok(())
+        });
+
         methods.add_method("get_progress", |lua, this, _: ()| {
             let mux = get_mux()?;
             let pane = this.resolve(&mux)?;

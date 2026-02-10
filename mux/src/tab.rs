@@ -491,7 +491,21 @@ fn apply_sizes_from_splits(tree: &Tree, size: &TerminalSize) {
             apply_sizes_from_splits(&*right, &data.second);
         }
         Tree::Leaf(pane) => {
-            pane.resize(*size).ok();
+            let size = if pane.get_header().is_some() && size.rows > 1 {
+                let cell_height = if size.rows > 0 {
+                    size.pixel_height / size.rows
+                } else {
+                    0
+                };
+                TerminalSize {
+                    rows: size.rows.saturating_sub(1),
+                    pixel_height: size.pixel_height.saturating_sub(cell_height),
+                    ..*size
+                }
+            } else {
+                *size
+            };
+            pane.resize(size).ok();
         }
     }
 }

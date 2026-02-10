@@ -182,6 +182,18 @@ pub struct Config {
     #[dynamic(default = "default_pane_select_bg_color")]
     pub pane_select_bg_color: RgbaColor,
 
+    #[dynamic(default = "default_pane_header_active_fg_color")]
+    pub pane_header_active_fg_color: RgbaColor,
+
+    #[dynamic(default = "default_pane_header_active_bg_color")]
+    pub pane_header_active_bg_color: RgbaColor,
+
+    #[dynamic(default = "default_pane_header_inactive_fg_color")]
+    pub pane_header_inactive_fg_color: RgbaColor,
+
+    #[dynamic(default = "default_pane_header_inactive_bg_color")]
+    pub pane_header_inactive_bg_color: RgbaColor,
+
     #[dynamic(default)]
     pub tab_bar_style: TabBarStyle,
 
@@ -1618,6 +1630,22 @@ fn default_pane_select_bg_color() -> RgbaColor {
 
 fn default_pane_select_font_size() -> f64 {
     36.0
+}
+
+fn default_pane_header_active_fg_color() -> RgbaColor {
+    SrgbaTuple(1.0, 1.0, 1.0, 1.0).into()
+}
+
+fn default_pane_header_active_bg_color() -> RgbaColor {
+    SrgbaTuple(0.0, 0.4, 0.8, 1.0).into()
+}
+
+fn default_pane_header_inactive_fg_color() -> RgbaColor {
+    SrgbaTuple(0.75, 0.75, 0.75, 1.0).into()
+}
+
+fn default_pane_header_inactive_bg_color() -> RgbaColor {
+    SrgbaTuple(0.2, 0.2, 0.2, 1.0).into()
 }
 
 fn default_integrated_title_buttons() -> Vec<IntegratedTitleButton> {
