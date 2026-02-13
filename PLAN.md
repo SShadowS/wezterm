@@ -3,8 +3,10 @@
 ## Current Status
 
 **Branch:** `claude/add-python-api-western-Ik3uz`
-**Phase 1: COMPLETE** (committed, pushed, needs local test validation)
-**Phase 2-5: NOT STARTED**
+**Phase 1: COMPLETE** (committed, pushed)
+**Phase 2: COMPLETE** (handlers.rs — 1323 lines, 28 tests)
+**Phase 3: COMPLETE** (server.rs — 687 lines, 17 tests)
+**Phase 4-5: NOT STARTED**
 
 ### What to do first on your machine
 
@@ -296,46 +298,219 @@ to read pane content, not %output. Add %output later if needed.
 
 ## Phase 4: CLI Shim Binary — NOT STARTED
 
-New crate: `tmux-compat-shim/` (small Rust binary)
+New crate: `tmux-compat-shim/` (small Rust binary, ~200 lines)
 
-### 4a. CLI argument parser
+Uses **Approach B (CC Protocol)** exclusively. The shim connects to the Phase 3
+CC server socket, sends a single command as a text line, reads the `%begin`/`%end`
+response, outputs the body to stdout, and exits. This is dramatically simpler
+than Approach A (direct mux RPC) which would require linking `wezterm-client`,
+`codec`, `mux`, and `config` — adding massive build complexity for no benefit.
 
-Parse tmux CLI arguments. Only need to handle the commands Claude Code uses:
+### Architecture
 
 ```
-tmux [-C|-CC] [new-session|attach-session] [-t TARGET]
-tmux split-window [-h|-v] [-t TARGET]
-tmux send-keys [-t TARGET] KEY...
-tmux capture-pane [-p] [-t TARGET] [-e] [-C] [-S N]
-tmux list-panes [-a] [-s] [-F FORMAT] [-t TARGET]
-tmux list-windows [-F FORMAT] [-t TARGET]
-tmux has-session [-t TARGET]
-tmux kill-pane [-t TARGET]
-tmux display-message [-p] [FORMAT]
+tmux split-window -h -t %3          <-- Claude Code runs this
+   |
+   v
+[tmux-compat-shim binary]
+   1. Parse CLI args into command text: "split-window -h -t %3"
+   2. Read socket path from WEZTERM_TMUX_CC env var
+   3. Connect to CC server via Unix domain socket
+   4. Skip initial handshake (greeting block + notifications)
+   5. Send command text + \n
+   6. Read response: find %begin, collect body until %end or %error
+   7. Print body to stdout (or stderr for errors)
+   8. Exit 0 (success) or exit 1 (error)
 ```
 
-### 4b. Connection to WezTerm
+### 4a. Crate structure
 
-Two options (implement both, prefer A):
+```
+tmux-compat-shim/
+├── Cargo.toml
+└── src/
+    └── main.rs         (~200 lines)
+```
 
-**A) Direct mux RPC**: Connect to WezTerm's existing Unix socket using the
-WezTerm codec. Reuses existing client infrastructure.
+**Cargo.toml:**
 
-**B) CC protocol**: Connect to the CC server socket, send one command, read the
-%begin/%end response, output the content, disconnect.
+```toml
+[package]
+name = "tmux-compat-shim"
+version = "0.1.0"
+authors = ["Wez Furlong <wez@wezfurlong.org>"]
+edition = "2018"
+publish = false
 
-### 4c. Output formatting
+[[bin]]
+name = "tmux"
+path = "src/main.rs"
 
-Format output exactly as `tmux` would for CLI mode:
-- `list-panes` -> one line per pane (format-expanded)
-- `capture-pane -p` -> raw pane text to stdout
-- `split-window` -> no output (exit 0)
-- `send-keys` -> no output (exit 0)
+[dependencies]
+anyhow.workspace = true
+wezterm-uds.workspace = true
+```
 
-### 4d. Environment detection
+**Key decisions:**
+- Binary name is `tmux` (via `[[bin]]`) so it shadows real tmux on `$PATH`
+- Only 2 dependencies: `anyhow` for errors, `wezterm-uds` for portable sockets
+- No `clap` — hand-parse args to keep binary tiny and fast (tmux CLI is simple)
+- No async runtime — synchronous I/O is fine for a one-shot command
 
-The shim checks `WEZTERM_UNIX_SOCKET` to find the mux server.
-If the var isn't set, fall through to real `tmux` if available.
+**Workspace integration:** Add `"tmux-compat-shim"` to `[workspace] members` in
+root `Cargo.toml`.
+
+### 4b. CLI argument parsing
+
+Hand-parsed (no clap) to keep the binary small and startup fast.
+
+The shim receives `tmux <args>` because it's named `tmux` on PATH.
+It needs to handle two modes:
+
+**Mode 1: One-shot command** (most common for Claude Code)
+```
+tmux split-window -h -t %3
+tmux send-keys -t %5 "echo hello" Enter
+tmux capture-pane -p -t %5 -S -50
+tmux list-panes -a -F "#{pane_id} #{pane_index}"
+tmux list-windows -F "#{window_id}"
+tmux has-session -t main
+tmux kill-pane -t %5
+tmux display-message -p "#{session_id}"
+```
+
+The shim reconstructs the command text by joining `args[1..]` with spaces
+(preserving quotes for args that contain spaces). This is exactly what the
+Phase 1 `command_parser::parse_command()` expects on the server side.
+
+**Mode 2: Session commands** (no-ops / special handling)
+```
+tmux -CC new-session -t main
+tmux -CC attach-session -t main
+tmux -C new-session
+```
+
+These are connection-mode commands. The shim handles them as follows:
+- `-C` / `-CC` flags: Ignored (the shim always uses one-shot mode)
+- `new-session`: Print nothing, exit 0 (session already exists in WezTerm)
+- `attach-session`: Print nothing, exit 0 (already attached)
+
+**Mode 3: Version / server-info queries**
+```
+tmux -V
+tmux list-commands
+```
+- `-V`: Print `tmux 3.3a (wezterm-compat)`, exit 0
+- `list-commands`: Forward to CC server (already handled by Phase 2)
+
+### 4c. Connection protocol
+
+**Socket path:** Read from `WEZTERM_TMUX_CC` environment variable.
+This is separate from `WEZTERM_UNIX_SOCKET` (which is the mux RPC socket).
+Phase 5 sets both when spawning shells.
+
+**Handshake skipping:** When the shim connects, the CC server sends:
+1. An empty `%begin TIMESTAMP N 1` / `%end TIMESTAMP N 1` greeting block
+2. `%session-changed $N NAME` notification
+3. One or more `%window-add @N` notifications
+
+The shim must read and discard all of this before sending its command.
+Strategy: read lines until we see the `%end` of the greeting block (counter=1),
+then drain any `%`-prefixed notification lines that follow before any command
+is sent. Use a short timeout (100ms with no data) to detect when the initial
+burst is done.
+
+**Simpler alternative:** Add a `--oneshot` mode to the CC server that skips
+the handshake. The shim sends `oneshot\n` as its first line, and the server
+responds with no greeting — just processes the next command and closes.
+This is a minor addition to `server.rs` (~10 lines) and eliminates the
+handshake complexity entirely.
+
+**Command send and response read:**
+```
+1. Write: "split-window -h -t %3\n"
+2. Read lines until we see "%begin TIMESTAMP N 1"
+3. Collect body lines until "%end TIMESTAMP N 1" (success) or "%error TIMESTAMP N 1" (error)
+4. Output body to stdout/stderr
+5. Close connection, exit
+```
+
+### 4d. Output formatting
+
+The CC server already formats responses exactly as tmux CLI would:
+- `list-panes` → one line per pane (format-expanded) — body is already correct
+- `capture-pane -p` → raw pane text — body is already correct
+- `split-window` → empty body — print nothing, exit 0
+- `send-keys` → empty body — print nothing, exit 0
+- `has-session` → empty body (success) or error text
+- `display-message -p` → expanded format string
+
+The shim just prints the response body verbatim. No extra formatting needed.
+
+### 4e. Error handling and fallthrough
+
+1. If `WEZTERM_TMUX_CC` is not set → try to exec real `tmux` (for non-WezTerm contexts)
+2. If connection to CC socket fails → print error to stderr, exit 1
+3. If server returns `%error` → print error body to stderr, exit 1
+4. If connection drops mid-response → print error to stderr, exit 1
+
+**Fallthrough to real tmux:**
+```rust
+fn exec_real_tmux() -> ! {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    // Search PATH for real tmux (skip ourselves)
+    // On Unix: exec() replaces process
+    // On Windows: std::process::Command + exit with its code
+}
+```
+
+### 4f. Tests
+
+Unit tests in `src/main.rs` (~8 tests):
+- `parse_oneshot_command` — "split-window -h -t %3" → correct command text
+- `parse_session_command` — "-CC new-session" → recognized as no-op
+- `parse_version` — "-V" → prints version string
+- `skip_handshake` — given a stream of greeting lines, correctly identifies end
+- `extract_response_success` — %begin/%end block → body text
+- `extract_response_error` — %begin/%error block → error text + exit 1
+- `empty_response` — %begin/%end with no body → empty string (exit 0)
+- `fallthrough_when_no_env` — no WEZTERM_TMUX_CC → attempts real tmux
+
+### 4g. Implementation checklist
+
+1. Create `tmux-compat-shim/Cargo.toml` with minimal deps
+2. Add `"tmux-compat-shim"` to workspace members in root `Cargo.toml`
+3. Implement `src/main.rs`:
+   - `main()` → parse args, dispatch
+   - `parse_args()` → detect mode (oneshot / session / version)
+   - `reconstruct_command()` → join args into command text
+   - `connect_and_execute()` → socket connect, handshake skip, send, read response
+   - `skip_handshake()` → consume greeting + initial notifications
+   - `read_response()` → parse %begin/%end/%error block
+   - `exec_real_tmux()` → fallthrough
+4. Add unit tests
+5. Verify: `cargo check -p tmux-compat-shim`
+6. Verify: `cargo test -p tmux-compat-shim`
+
+### 4h. Optional: `--oneshot` mode in server.rs (~10 lines)
+
+Add to `process_cc_connection()` in `server.rs`: if the first line received is
+`"oneshot"`, skip the initial handshake. This makes the shim simpler and faster.
+
+```rust
+// In process_cc_connection, after creating session:
+let first_line = read_first_line(&mut stream).await?;
+let oneshot = first_line.trim() == "oneshot";
+
+if !oneshot {
+    // Normal CC client: send greeting
+    let handshake = build_initial_handshake(&mut session);
+    stream.write_all(handshake.as_bytes()).await?;
+    stream.flush().await?;
+    // Process first_line as a command if it's not empty
+}
+// For oneshot: skip greeting, wait for the actual command
+```
 
 ---
 
@@ -359,15 +534,53 @@ config.tmux_compat = {
 When tmux compat is enabled, WezTerm sets in spawned shells:
 
 ```
-TMUX=/tmp/wezterm-tmux-{pid},{pid},0
-PATH=/path/to/tmux-shim-dir:$PATH
+TMUX=/path/to/cc-socket,{pid},0       -- makes Claude Code detect "tmux" mode
+WEZTERM_TMUX_CC=/path/to/cc-socket    -- shim uses this to find the CC server
+PATH=/path/to/tmux-shim-dir:$PATH     -- shim shadows real tmux
 ```
 
-### 5c. Shim installation
+The CC socket path follows WezTerm's existing convention:
+`config::RUNTIME_DIR/tmux-cc-{pid}` (similar to `gui-sock-{pid}`).
 
-The tmux-compat shim binary is built as part of WezTerm and installed alongside.
-A wrapper directory containing a symlink `tmux -> wezterm-tmux-compat` is prepended
-to `$PATH`.
+The `TMUX` variable is what Claude Code checks to detect tmux mode. Its format
+is `socket_path,pid,session` — we reuse the CC socket path here.
+
+### 5c. CC server startup
+
+In the GUI startup path (`wezterm-gui/src/main.rs`), after setting
+`WEZTERM_UNIX_SOCKET`, also start the CC listener:
+
+```rust
+if config.enable_tmux_compat {
+    let cc_path = config::RUNTIME_DIR.join(format!("tmux-cc-{}", std::process::id()));
+    std::env::set_var("WEZTERM_TMUX_CC", &cc_path);
+    mux::tmux_compat_server::server::start_tmux_compat_listener(&cc_path)?;
+}
+```
+
+### 5d. Shim installation
+
+The `tmux` binary (from `tmux-compat-shim` crate) is built as part of WezTerm.
+A wrapper directory containing the `tmux` binary is prepended to `$PATH` in
+spawned shells so it shadows the real tmux.
+
+On install:
+```
+$INSTALL_DIR/
+  wezterm
+  wezterm-gui
+  wezterm-mux-server
+  tmux-compat/
+    tmux              <-- the shim binary
+```
+
+Environment setup prepends `$INSTALL_DIR/tmux-compat` to PATH.
+
+### 5e. Cleanup
+
+When WezTerm exits, the CC socket file is cleaned up (the listener thread exits
+when the process terminates, and the socket file is already removed-on-bind in
+`start_tmux_compat_listener`).
 
 ---
 
@@ -386,39 +599,52 @@ mux/src/tmux_compat_server/
     id_map.rs           -- bidirectional ID mapping (270 lines, 5 tests)
 ```
 
-### Still to create:
+### Created (Phase 2):
 
 ```
 mux/src/tmux_compat_server/
-    handlers.rs         -- per-command handlers wired to Mux (Phase 2)
-    server.rs           -- CC protocol server, socket listener, notifications (Phase 3)
+    handlers.rs         -- per-command handlers wired to Mux (1323 lines, 28 tests)
+```
 
+### Created (Phase 3):
+
+```
+mux/src/tmux_compat_server/
+    server.rs           -- CC protocol server, socket listener, notifications (687 lines, 17 tests)
+```
+
+### Still to create:
+
+```
 tmux-compat-shim/
-    Cargo.toml          -- new crate for the shim binary (Phase 4)
-    src/main.rs         -- tmux CLI argument parser + WezTerm mux client (Phase 4)
+    Cargo.toml          -- new crate: deps are anyhow + wezterm-uds only (Phase 4)
+    src/main.rs         -- CLI arg parser + CC socket client (~200 lines) (Phase 4)
 ```
 
 ### Files to modify:
 
 ```
-mux/src/lib.rs              -- already modified (pub mod tmux_compat_server)
-mux/Cargo.toml              -- may need new deps for Phase 2-3
-Cargo.toml (workspace)      -- add tmux-compat-shim crate (Phase 4)
+Cargo.toml (workspace)      -- add tmux-compat-shim to members (Phase 4)
+mux/src/tmux_compat_server/server.rs -- optional: add oneshot mode (Phase 4h)
+wezterm-gui/src/main.rs     -- start CC listener on startup (Phase 5)
+config/src/lib.rs           -- add enable_tmux_compat config option (Phase 5)
+mux/src/domain.rs           -- set WEZTERM_TMUX_CC + TMUX + PATH in spawned shells (Phase 5)
 ```
 
 ## Test Strategy
 
 | Phase | Approach | How to run |
 |-------|----------|------------|
-| Phase 1 | Unit tests, pure logic, no I/O | `cargo test -p mux --lib tmux_compat_server` |
-| Phase 2 | Integration tests needing Mux singleton | `cargo test -p mux --lib tmux_compat_server::handlers` (may need `#[cfg(test)]` mock setup) |
-| Phase 3 | Server integration (spawn, connect, verify) | `cargo test -p mux --test tmux_compat_server_integration` |
-| Phase 4 | E2E (spawn WezTerm + shim, verify behavior) | Manual or `cargo test -p tmux-compat-shim` |
+| Phase 1 | Unit tests, pure logic, no I/O (84 tests) | `cargo test -p mux --lib tmux_compat_server` |
+| Phase 2 | Unit tests with mock Mux state (28 tests) | `cargo test -p mux --lib tmux_compat_server::handlers` |
+| Phase 3 | Unit tests for layout/notification/line-extraction (17 tests) | `cargo test -p mux --lib tmux_compat_server::server` |
+| Phase 4 | Unit tests for arg parsing + response extraction (~8 tests) | `cargo test -p tmux-compat-shim` |
+| Phase 5 | Manual E2E: start WezTerm, run shim commands, verify | Manual testing |
 
 ## Implementation Order
 
 1. ~~Phase 1 (all pure, all testable) — **DONE**~~
-2. Phase 2 (handlers, needs mux access, ~400 lines)
-3. Phase 3 (server, socket, notifications, ~300 lines)
-4. Phase 4 (shim binary, ~200 lines)
-5. Phase 5 (config integration, env vars, ~100 lines)
+2. ~~Phase 2 (handlers, wired to Mux, 1323 lines, 28 tests) — **DONE**~~
+3. ~~Phase 3 (server, socket, notifications, 687 lines, 17 tests) — **DONE**~~
+4. Phase 4 (shim binary via CC protocol, ~200 lines, ~8 tests)
+5. Phase 5 (config integration, env vars, CC server startup, ~100 lines)

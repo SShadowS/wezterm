@@ -1,0 +1,14 @@
+[package]
+name = "tmux-compat-shim"
+version = "0.1.0"
+authors = ["Wez Furlong <wez@wezfurlong.org>"]
+edition = "2018"
+publish = false
+
+[[bin]]
+name = "tmux"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+wezterm-uds.workspace = true
