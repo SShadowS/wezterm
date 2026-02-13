@@ -46,6 +46,7 @@ pub mod tab;
 pub mod termwiztermtab;
 pub mod tmux;
 pub mod tmux_commands;
+pub mod tmux_compat_server;
 mod tmux_pty;
 pub mod window;
 
