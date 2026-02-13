@@ -50,6 +50,7 @@ dhat-heap.json
 /docs/config/lua/window/index.md
 /docs/mermaid.min.js
 **/*.rs.bk
+*.rlib
 .*.sw*
 /esctest.log
 /AppDir
