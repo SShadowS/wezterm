@@ -90,10 +90,7 @@ pub fn parse_target(target: &str) -> Result<TmuxTarget> {
 
     // Split on `:` to separate the session part from the window.pane part.
     let (session_part, window_pane_part) = if let Some(colon_pos) = target.find(':') {
-        (
-            &target[..colon_pos],
-            Some(&target[colon_pos + 1..]),
-        )
+        (&target[..colon_pos], Some(&target[colon_pos + 1..]))
     } else {
         // No colon: the entire string is the window.pane portion
         // (no session specified).

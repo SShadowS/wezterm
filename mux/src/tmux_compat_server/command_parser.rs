@@ -125,10 +125,7 @@ pub fn parse_command(line: &str) -> Result<TmuxCliCommand> {
 ///
 /// Returns an error if the iterator is exhausted (the flag was provided
 /// without a value).
-fn take_flag_value<'a>(
-    flag: &str,
-    iter: &mut impl Iterator<Item = &'a str>,
-) -> Result<String> {
+fn take_flag_value<'a>(flag: &str, iter: &mut impl Iterator<Item = &'a str>) -> Result<String> {
     match iter.next() {
         Some(val) => Ok(val.to_string()),
         None => bail!("flag {flag} requires a value"),
@@ -210,17 +207,17 @@ fn parse_capture_pane(args: &[String]) -> Result<TmuxCliCommand> {
             "-C" => octal_escape = true,
             "-S" => {
                 let val = take_flag_value("-S", &mut iter)?;
-                start_line = Some(
-                    val.parse::<i64>()
-                        .map_err(|_| anyhow::anyhow!("capture-pane -S: invalid number: {val:?}"))?,
-                );
+                start_line =
+                    Some(val.parse::<i64>().map_err(|_| {
+                        anyhow::anyhow!("capture-pane -S: invalid number: {val:?}")
+                    })?);
             }
             "-E" => {
                 let val = take_flag_value("-E", &mut iter)?;
-                end_line = Some(
-                    val.parse::<i64>()
-                        .map_err(|_| anyhow::anyhow!("capture-pane -E: invalid number: {val:?}"))?,
-                );
+                end_line =
+                    Some(val.parse::<i64>().map_err(|_| {
+                        anyhow::anyhow!("capture-pane -E: invalid number: {val:?}")
+                    })?);
             }
             other => bail!("capture-pane: unexpected argument: {other:?}"),
         }
@@ -409,15 +406,17 @@ fn parse_resize_window(args: &[String]) -> Result<TmuxCliCommand> {
             "-t" => target = Some(take_flag_value("-t", &mut iter)?),
             "-x" => {
                 let val = take_flag_value("-x", &mut iter)?;
-                width = Some(val.parse::<u64>().map_err(|_| {
-                    anyhow::anyhow!("resize-window -x: invalid number: {val:?}")
-                })?);
+                width =
+                    Some(val.parse::<u64>().map_err(|_| {
+                        anyhow::anyhow!("resize-window -x: invalid number: {val:?}")
+                    })?);
             }
             "-y" => {
                 let val = take_flag_value("-y", &mut iter)?;
-                height = Some(val.parse::<u64>().map_err(|_| {
-                    anyhow::anyhow!("resize-window -y: invalid number: {val:?}")
-                })?);
+                height =
+                    Some(val.parse::<u64>().map_err(|_| {
+                        anyhow::anyhow!("resize-window -y: invalid number: {val:?}")
+                    })?);
             }
             other => bail!("resize-window: unexpected argument: {other:?}"),
         }
@@ -1013,10 +1012,7 @@ mod tests {
 
     #[test]
     fn leading_and_trailing_whitespace() {
-        assert_eq!(
-            parse("  list-commands  "),
-            TmuxCliCommand::ListCommands,
-        );
+        assert_eq!(parse("  list-commands  "), TmuxCliCommand::ListCommands,);
     }
 
     #[test]

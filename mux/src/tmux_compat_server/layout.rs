@@ -302,8 +302,7 @@ mod tests {
             ],
         };
         let result = generate_layout_string(&root);
-        let expected_desc =
-            "160x40,0,0{80x40,0,0,0,79x40,81,0[79x20,81,0,1,79x19,81,21,2]}";
+        let expected_desc = "160x40,0,0{80x40,0,0,0,79x40,81,0[79x20,81,0,1,79x19,81,21,2]}";
         let expected_csum = layout_checksum(expected_desc);
         assert_eq!(result, format!("{expected_csum:04x},{expected_desc}"));
     }

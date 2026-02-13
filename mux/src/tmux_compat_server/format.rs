@@ -296,10 +296,7 @@ mod tests {
             pane_height: 24,
             ..Default::default()
         };
-        assert_eq!(
-            expand_format("#{pane_width}x#{pane_height}", &ctx),
-            "80x24"
-        );
+        assert_eq!(expand_format("#{pane_width}x#{pane_height}", &ctx), "80x24");
     }
 
     #[test]
@@ -308,10 +305,7 @@ mod tests {
             pane_active: true,
             ..Default::default()
         };
-        assert_eq!(
-            expand_format("#{?pane_active,active,}", &ctx),
-            "active"
-        );
+        assert_eq!(expand_format("#{?pane_active,active,}", &ctx), "active");
     }
 
     #[test]
@@ -341,10 +335,7 @@ mod tests {
             pane_active: false,
             ..Default::default()
         };
-        assert_eq!(
-            expand_format("#{?pane_active,yes,no}", &ctx),
-            "no"
-        );
+        assert_eq!(expand_format("#{?pane_active,yes,no}", &ctx), "no");
     }
 
     #[test]
@@ -375,7 +366,8 @@ mod tests {
             pane_active: true,
             ..Default::default()
         };
-        let fmt = "#{pane_index}: [#{pane_width}x#{pane_height}] #{pane_id}#{?pane_active, (active),}";
+        let fmt =
+            "#{pane_index}: [#{pane_width}x#{pane_height}] #{pane_id}#{?pane_active, (active),}";
         assert_eq!(expand_format(fmt, &ctx), "0: [80x24] %5 (active)");
     }
 
@@ -389,7 +381,8 @@ mod tests {
             pane_active: false,
             ..Default::default()
         };
-        let fmt = "#{pane_index}: [#{pane_width}x#{pane_height}] #{pane_id}#{?pane_active, (active),}";
+        let fmt =
+            "#{pane_index}: [#{pane_width}x#{pane_height}] #{pane_id}#{?pane_active, (active),}";
         assert_eq!(expand_format(fmt, &ctx), "1: [40x24] %6");
     }
 
@@ -469,14 +462,8 @@ mod tests {
             window_active: false,
             ..Default::default()
         };
-        assert_eq!(
-            expand_format("#{?window_active,*,-}", &active_ctx),
-            "*"
-        );
-        assert_eq!(
-            expand_format("#{?window_active,*,-}", &inactive_ctx),
-            "-"
-        );
+        assert_eq!(expand_format("#{?window_active,*,-}", &active_ctx), "*");
+        assert_eq!(expand_format("#{?window_active,*,-}", &inactive_ctx), "-");
     }
 
     #[test]
@@ -489,10 +476,7 @@ mod tests {
             pane_dead: false,
             ..Default::default()
         };
-        assert_eq!(
-            expand_format("#{?pane_dead,DEAD,ALIVE}", &dead_ctx),
-            "DEAD"
-        );
+        assert_eq!(expand_format("#{?pane_dead,DEAD,ALIVE}", &dead_ctx), "DEAD");
         assert_eq!(
             expand_format("#{?pane_dead,DEAD,ALIVE}", &alive_ctx),
             "ALIVE"
@@ -506,19 +490,13 @@ mod tests {
             window_id: 3,
             ..Default::default()
         };
-        assert_eq!(
-            expand_format("#{pane_id}#{window_id}", &ctx),
-            "%10@3"
-        );
+        assert_eq!(expand_format("#{pane_id}#{window_id}", &ctx), "%10@3");
     }
 
     #[test]
     fn conditional_unknown_variable_is_falsy() {
         let ctx = test_ctx();
         // Unknown variable resolves to "" which is falsy.
-        assert_eq!(
-            expand_format("#{?nonexistent,yes,no}", &ctx),
-            "no"
-        );
+        assert_eq!(expand_format("#{?nonexistent,yes,no}", &ctx), "no");
     }
 }

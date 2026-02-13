@@ -75,13 +75,7 @@ impl ResponseWriter {
 
     /// Inner helper that accepts an explicit timestamp and counter, making it
     /// easy to test without worrying about wall-clock time.
-    fn format_guard_block_with(
-        &self,
-        ts: i64,
-        n: u64,
-        body: &str,
-        is_error: bool,
-    ) -> String {
+    fn format_guard_block_with(&self, ts: i64, n: u64, body: &str, is_error: bool) -> String {
         let end_tag = if is_error { "%error" } else { "%end" };
 
         let mut out = String::new();
@@ -220,7 +214,11 @@ mod tests {
         for b in 0u8..0x20 {
             let encoded = vis_encode(&[b]);
             assert_eq!(encoded.len(), 4, "byte {:#04x} should produce 4 chars", b);
-            assert!(encoded.starts_with('\\'), "byte {:#04x} should start with \\", b);
+            assert!(
+                encoded.starts_with('\\'),
+                "byte {:#04x} should start with \\",
+                b
+            );
         }
     }
 

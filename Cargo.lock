@@ -3455,6 +3455,7 @@ name = "mux"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-io",
  "async-trait",
  "base64 0.22.1",
  "bintree",
@@ -3466,6 +3467,7 @@ dependencies = [
  "fancy-regex",
  "filedescriptor",
  "finl_unicode",
+ "futures",
  "hostname",
  "k9",
  "lazy_static",
@@ -3496,6 +3498,7 @@ dependencies = [
  "wezterm-dynamic",
  "wezterm-ssh",
  "wezterm-term",
+ "wezterm-uds",
  "winapi",
 ]
 
@@ -5961,6 +5964,14 @@ name = "tinyvec_macros"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1f3ccbac311fea05f86f61904b462b55fb3df8837a366dfc601a0161d0532f20"
+
+[[package]]
+name = "tmux-compat-shim"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "wezterm-uds",
+]
 
 [[package]]
 name = "tokio"
