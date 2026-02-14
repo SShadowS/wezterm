@@ -75,12 +75,31 @@ fn parse_args(args: &[String]) -> Action {
     }
 
     // Everything else: reconstruct the command text.
-    // We need to re-quote arguments that contain spaces so the server's
-    // shell_words-based parser can split them correctly.
+    // We need to re-quote arguments that contain shell-special characters
+    // so the server's shell_words-based parser can split them correctly.
+    // Notably, `#` is treated as a comment character by POSIX shell parsing,
+    // so format strings like `#{pane_id}` must be quoted.
     let command_text = rest
         .iter()
         .map(|a| {
-            if a.contains(' ') || a.contains('"') || a.contains('\'') || a.is_empty() {
+            if a.is_empty()
+                || a.contains(' ')
+                || a.contains('"')
+                || a.contains('\'')
+                || a.contains('#')
+                || a.contains('{')
+                || a.contains('}')
+                || a.contains('(')
+                || a.contains(')')
+                || a.contains('$')
+                || a.contains('`')
+                || a.contains('\\')
+                || a.contains(';')
+                || a.contains('&')
+                || a.contains('|')
+                || a.contains('>')
+                || a.contains('<')
+            {
                 // Shell-quote: wrap in single quotes, escaping existing single quotes.
                 format!("'{}'", a.replace('\'', "'\\''"))
             } else {
