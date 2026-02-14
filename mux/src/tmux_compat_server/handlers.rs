@@ -121,6 +121,40 @@ impl HandlerContext {
             subscriptions: Vec::new(),
         }
     }
+
+    /// Create a context with ID mappings restored from disk.
+    ///
+    /// Loads previously persisted pane/window/session ID mappings so that
+    /// reconnecting CC clients see the same tmux IDs as before.
+    /// Stale mappings (referencing panes/tabs that no longer exist) are pruned.
+    pub fn with_persistent_ids(workspace: String) -> Self {
+        let mut id_map = IdMap::load(&workspace);
+
+        // Prune mappings that reference dead panes/tabs.
+        if let Some(mux) = Mux::try_get() {
+            let live_pane_ids: std::collections::HashSet<PaneId> =
+                mux.iter_panes().into_iter().map(|p| p.pane_id()).collect();
+            let live_tab_ids: std::collections::HashSet<crate::tab::TabId> = mux
+                .iter_windows_in_workspace(&workspace)
+                .iter()
+                .flat_map(|wid| {
+                    mux.get_window(*wid)
+                        .map(|w| w.iter().map(|t| t.tab_id()).collect::<Vec<_>>())
+                        .unwrap_or_default()
+                })
+                .collect();
+            id_map.prune_stale(&live_pane_ids, &live_tab_ids);
+        }
+
+        let mut ctx = Self::new(workspace);
+        ctx.id_map = id_map;
+        ctx
+    }
+
+    /// Persist the current ID mappings to disk.
+    pub fn save_id_map(&self) {
+        self.id_map.save(&self.workspace);
+    }
 }
 
 // ---------------------------------------------------------------------------

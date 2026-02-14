@@ -38,7 +38,7 @@ pub struct TmuxCompatSession {
 impl TmuxCompatSession {
     pub fn new(workspace: String) -> Self {
         Self {
-            ctx: HandlerContext::new(workspace),
+            ctx: HandlerContext::with_persistent_ids(workspace),
             writer: ResponseWriter::new(),
             line_buffer: String::new(),
         }
@@ -609,6 +609,11 @@ fn process_cc_connection_sync(
             }
         };
         session.ctx = ctx_back;
+
+        // Persist ID mappings after each command (best-effort).
+        if response.is_ok() {
+            session.ctx.save_id_map();
+        }
 
         let formatted = match response {
             Ok(ref body) if body.is_empty() => session.writer.empty_success(),

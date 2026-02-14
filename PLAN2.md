@@ -1,7 +1,7 @@
 # PLAN2.md — Tmux CC Protocol Compatibility Roadmap
 
 **Created**: 2026-02-14
-**Status**: Active development — Phases 1-12.4 complete, Phase 12.5 remaining
+**Status**: Active development — Phases 1-12.5 complete (all Phase 12 sub-phases done)
 
 ---
 
@@ -576,18 +576,22 @@ Subscriptions eliminate polling overhead. iTerm2's `iTermTmuxOptionMonitor` uses
 - **Files**: `command_parser.rs`, `handlers.rs`
 - **Note**: iTerm2 sends `copy-mode -q` on connect as defensive measure (tmux issue #3193)
 
-### 12.5 — Persistent ID Mapping (MEDIUM)
+### 12.5 — Persistent ID Mapping (MEDIUM) ✅
 
 **Priority**: MEDIUM — enables session recovery across reconnects
-**Status**: [ ] Not started
+**Status**: [x] Complete
 
-- [ ] Add `serde::Serialize`/`Deserialize` derives to IdMap
-- [ ] Save IdMap to `~/.cache/wezterm/tmux-id-map-<workspace>.json` on each update
-- [ ] Load on server startup, restore previous mappings
-- [ ] Handle ID collision detection (new panes may reuse old numeric IDs)
-- [ ] Strategy: key by (workspace, pane_title, position) for semantic identity
-- **Files**: `id_map.rs`, `server.rs`
-- **Difficulty**: Medium (serialization is easy; collision handling and semantic identity are harder)
+- [x] Add `serde_json` dependency to `mux/Cargo.toml`
+- [x] Add `IdMapSnapshot` struct with `Serialize`/`Deserialize` derives
+- [x] `save()` — serializes IdMap to `<CACHE_DIR>/tmux-id-map-<workspace>.json`
+- [x] `load()` — deserializes from disk, returns fresh IdMap on missing/corrupt file
+- [x] `prune_stale()` — removes dead pane/tab mappings referencing IDs no longer in the Mux
+- [x] `id_map_path()` — sanitizes workspace name for filename safety
+- [x] `with_persistent_ids()` on HandlerContext — loads from disk + prunes stale on startup
+- [x] `save_id_map()` on HandlerContext — called after each successful command dispatch
+- [x] 7 new tests (prune_stale×3, snapshot round-trip, save/load round-trip, load nonexistent, path sanitization)
+- **Files**: `id_map.rs`, `handlers.rs`, `server.rs`, `mux/Cargo.toml`
+- **Strategy**: Monotonic counters preserved across restarts; stale entries pruned against live Mux state
 
 ### DROPPED from Phase 12
 

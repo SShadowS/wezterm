@@ -3,8 +3,14 @@
 //! WezTerm uses `usize` IDs for panes and tabs, and `String` workspace names.
 //! Tmux uses prefixed IDs: `%N` (panes), `@N` (windows), `$N` (sessions).
 //! This module provides O(1) bidirectional lookups between the two.
+//!
+//! Mappings can be persisted to disk and restored on reconnect so that
+//! tmux clients see stable IDs across WezTerm restarts.
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
 
 /// WezTerm's PaneId type
 pub type PaneId = usize;
@@ -210,6 +216,176 @@ impl IdMap {
             .remove(&mux_window_id)
             .unwrap_or_default()
     }
+
+    // --- Pruning ---
+
+    /// Remove stale mappings that reference WezTerm IDs no longer present in the Mux.
+    ///
+    /// After loading from disk, some pane/tab IDs may no longer exist (e.g. after
+    /// a WezTerm restart). This removes those dead entries to prevent ID collisions.
+    ///
+    /// `live_pane_ids` and `live_tab_ids` are the currently existing IDs from the Mux.
+    pub fn prune_stale(&mut self, live_pane_ids: &HashSet<PaneId>, live_tab_ids: &HashSet<TabId>) {
+        // Remove pane mappings for panes that no longer exist.
+        let stale_panes: Vec<PaneId> = self
+            .wez_to_tmux_pane
+            .keys()
+            .filter(|id| !live_pane_ids.contains(id))
+            .copied()
+            .collect();
+        for wez_id in stale_panes {
+            if let Some(tmux_id) = self.wez_to_tmux_pane.remove(&wez_id) {
+                self.tmux_to_wez_pane.remove(&tmux_id);
+            }
+        }
+
+        // Remove window/tab mappings for tabs that no longer exist.
+        let stale_tabs: Vec<TabId> = self
+            .wez_to_tmux_window
+            .keys()
+            .filter(|id| !live_tab_ids.contains(id))
+            .copied()
+            .collect();
+        for wez_id in stale_tabs {
+            if let Some(tmux_id) = self.wez_to_tmux_window.remove(&wez_id) {
+                self.tmux_to_wez_window.remove(&tmux_id);
+            }
+        }
+    }
+
+    // --- Persistence ---
+
+    /// Save the current ID mappings to disk for the given workspace.
+    ///
+    /// The file is written to `<CACHE_DIR>/tmux-id-map-<workspace>.json`.
+    /// Errors are logged but not propagated — persistence is best-effort.
+    pub fn save(&self, workspace: &str) {
+        let snapshot = IdMapSnapshot {
+            pane_mappings: self
+                .wez_to_tmux_pane
+                .iter()
+                .map(|(&wez, &tmux)| (wez, tmux))
+                .collect(),
+            window_mappings: self
+                .wez_to_tmux_window
+                .iter()
+                .map(|(&wez, &tmux)| (wez, tmux))
+                .collect(),
+            session_mappings: self
+                .workspace_to_tmux_session
+                .iter()
+                .map(|(ws, &tmux)| (ws.clone(), tmux))
+                .collect(),
+            next_pane_id: self.next_pane_id,
+            next_window_id: self.next_window_id,
+            next_session_id: self.next_session_id,
+        };
+
+        let path = match id_map_path(workspace) {
+            Some(p) => p,
+            None => return,
+        };
+
+        if let Some(parent) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                log::warn!("tmux id-map: failed to create cache dir: {}", e);
+                return;
+            }
+        }
+
+        match serde_json::to_string_pretty(&snapshot) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(&path, json) {
+                    log::warn!("tmux id-map: failed to write {}: {}", path.display(), e);
+                }
+            }
+            Err(e) => {
+                log::warn!("tmux id-map: failed to serialize: {}", e);
+            }
+        }
+    }
+
+    /// Load previously saved ID mappings for the given workspace.
+    ///
+    /// Returns a new `IdMap` pre-populated with the saved mappings, or
+    /// a fresh `IdMap` if the file doesn't exist or can't be read.
+    pub fn load(workspace: &str) -> Self {
+        let path = match id_map_path(workspace) {
+            Some(p) => p,
+            None => return IdMap::new(),
+        };
+
+        let json = match std::fs::read_to_string(&path) {
+            Ok(j) => j,
+            Err(_) => return IdMap::new(),
+        };
+
+        let snapshot: IdMapSnapshot = match serde_json::from_str(&json) {
+            Ok(s) => s,
+            Err(e) => {
+                log::warn!(
+                    "tmux id-map: failed to parse {}: {}",
+                    path.display(),
+                    e
+                );
+                return IdMap::new();
+            }
+        };
+
+        snapshot.into_id_map()
+    }
+}
+
+/// Serializable snapshot of ID mappings for persistence.
+#[derive(Serialize, Deserialize, Debug)]
+struct IdMapSnapshot {
+    /// `[(wez_pane_id, tmux_pane_id)]`
+    pane_mappings: Vec<(PaneId, u64)>,
+    /// `[(wez_tab_id, tmux_window_id)]`
+    window_mappings: Vec<(TabId, u64)>,
+    /// `[(workspace_name, tmux_session_id)]`
+    session_mappings: Vec<(String, u64)>,
+    next_pane_id: u64,
+    next_window_id: u64,
+    next_session_id: u64,
+}
+
+impl IdMapSnapshot {
+    /// Convert a loaded snapshot into a live `IdMap`.
+    fn into_id_map(self) -> IdMap {
+        let mut map = IdMap::new();
+
+        for (wez, tmux) in self.pane_mappings {
+            map.wez_to_tmux_pane.insert(wez, tmux);
+            map.tmux_to_wez_pane.insert(tmux, wez);
+        }
+
+        for (wez, tmux) in self.window_mappings {
+            map.wez_to_tmux_window.insert(wez, tmux);
+            map.tmux_to_wez_window.insert(tmux, wez);
+        }
+
+        for (ws, tmux) in self.session_mappings {
+            map.tmux_to_workspace.insert(tmux, ws.clone());
+            map.workspace_to_tmux_session.insert(ws, tmux);
+        }
+
+        map.next_pane_id = self.next_pane_id;
+        map.next_window_id = self.next_window_id;
+        map.next_session_id = self.next_session_id;
+
+        map
+    }
+}
+
+/// Compute the file path for persisted ID mappings.
+fn id_map_path(workspace: &str) -> Option<PathBuf> {
+    // Sanitize workspace name for use as a filename.
+    let safe_name: String = workspace
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    Some(config::CACHE_DIR.join(format!("tmux-id-map-{}.json", safe_name)))
 }
 
 #[cfg(test)]
@@ -397,5 +573,156 @@ mod tests {
         map.rename_session("old", "new");
         assert_eq!(map.mux_window_workspace(1), Some("new"));
         assert_eq!(map.mux_window_workspace(2), Some("new"));
+    }
+
+    // --- Persistence tests ---
+
+    #[test]
+    fn test_prune_stale_removes_dead_panes() {
+        let mut map = IdMap::new();
+        map.get_or_create_tmux_pane_id(10); // tmux %0
+        map.get_or_create_tmux_pane_id(20); // tmux %1
+        map.get_or_create_tmux_pane_id(30); // tmux %2
+
+        // Only pane 20 is still alive.
+        let live_panes: HashSet<PaneId> = [20].iter().copied().collect();
+        let live_tabs: HashSet<TabId> = HashSet::new();
+        map.prune_stale(&live_panes, &live_tabs);
+
+        assert_eq!(map.tmux_pane_id(10), None);
+        assert_eq!(map.wezterm_pane_id(0), None);
+        assert_eq!(map.tmux_pane_id(20), Some(1)); // still alive
+        assert_eq!(map.wezterm_pane_id(1), Some(20));
+        assert_eq!(map.tmux_pane_id(30), None);
+        assert_eq!(map.wezterm_pane_id(2), None);
+    }
+
+    #[test]
+    fn test_prune_stale_removes_dead_windows() {
+        let mut map = IdMap::new();
+        map.get_or_create_tmux_window_id(100); // tmux @0
+        map.get_or_create_tmux_window_id(200); // tmux @1
+
+        // Only tab 200 is still alive.
+        let live_panes: HashSet<PaneId> = HashSet::new();
+        let live_tabs: HashSet<TabId> = [200].iter().copied().collect();
+        map.prune_stale(&live_panes, &live_tabs);
+
+        assert_eq!(map.tmux_window_id(100), None);
+        assert_eq!(map.wezterm_tab_id(0), None);
+        assert_eq!(map.tmux_window_id(200), Some(1)); // still alive
+        assert_eq!(map.wezterm_tab_id(1), Some(200));
+    }
+
+    #[test]
+    fn test_prune_stale_preserves_counters() {
+        let mut map = IdMap::new();
+        map.get_or_create_tmux_pane_id(10); // %0
+        map.get_or_create_tmux_pane_id(20); // %1
+
+        let live: HashSet<PaneId> = HashSet::new();
+        map.prune_stale(&live, &HashSet::new());
+
+        // After pruning, the counter should still be at 2 — next pane gets %2, not %0.
+        map.get_or_create_tmux_pane_id(30);
+        assert_eq!(map.tmux_pane_id(30), Some(2));
+    }
+
+    #[test]
+    fn test_snapshot_round_trip() {
+        let mut map = IdMap::new();
+        map.get_or_create_tmux_pane_id(10);
+        map.get_or_create_tmux_pane_id(20);
+        map.get_or_create_tmux_window_id(100);
+        map.get_or_create_tmux_session_id("default");
+        map.get_or_create_tmux_session_id("work");
+
+        // Serialize to JSON and back via IdMapSnapshot.
+        let snapshot = IdMapSnapshot {
+            pane_mappings: map
+                .wez_to_tmux_pane
+                .iter()
+                .map(|(&w, &t)| (w, t))
+                .collect(),
+            window_mappings: map
+                .wez_to_tmux_window
+                .iter()
+                .map(|(&w, &t)| (w, t))
+                .collect(),
+            session_mappings: map
+                .workspace_to_tmux_session
+                .iter()
+                .map(|(ws, &t)| (ws.clone(), t))
+                .collect(),
+            next_pane_id: 2,
+            next_window_id: 1,
+            next_session_id: 2,
+        };
+        let json = serde_json::to_string(&snapshot).unwrap();
+        let loaded: IdMapSnapshot = serde_json::from_str(&json).unwrap();
+        let restored = loaded.into_id_map();
+
+        // Verify all mappings survived.
+        assert_eq!(restored.tmux_pane_id(10), Some(0));
+        assert_eq!(restored.tmux_pane_id(20), Some(1));
+        assert_eq!(restored.wezterm_pane_id(0), Some(10));
+        assert_eq!(restored.wezterm_pane_id(1), Some(20));
+        assert_eq!(restored.tmux_window_id(100), Some(0));
+        assert_eq!(restored.wezterm_tab_id(0), Some(100));
+        assert_eq!(restored.tmux_session_id("default"), Some(0));
+        assert_eq!(restored.tmux_session_id("work"), Some(1));
+        assert_eq!(restored.workspace_name(0), Some("default"));
+        assert_eq!(restored.workspace_name(1), Some("work"));
+
+        // Counters preserved — next IDs continue from where we left off.
+        let mut restored = restored;
+        assert_eq!(restored.get_or_create_tmux_pane_id(30), 2);
+        assert_eq!(restored.get_or_create_tmux_window_id(200), 1);
+        assert_eq!(restored.get_or_create_tmux_session_id("other"), 2);
+    }
+
+    #[test]
+    fn test_save_and_load_round_trip() {
+        // Use a unique temp workspace name to avoid conflicts.
+        let workspace = format!("_test_persist_{}", std::process::id());
+
+        let mut map = IdMap::new();
+        map.get_or_create_tmux_pane_id(42);
+        map.get_or_create_tmux_pane_id(99);
+        map.get_or_create_tmux_window_id(7);
+        map.get_or_create_tmux_session_id("myworkspace");
+
+        map.save(&workspace);
+
+        let loaded = IdMap::load(&workspace);
+        assert_eq!(loaded.tmux_pane_id(42), Some(0));
+        assert_eq!(loaded.tmux_pane_id(99), Some(1));
+        assert_eq!(loaded.wezterm_pane_id(0), Some(42));
+        assert_eq!(loaded.tmux_window_id(7), Some(0));
+        assert_eq!(loaded.tmux_session_id("myworkspace"), Some(0));
+
+        // Clean up the test file.
+        if let Some(path) = id_map_path(&workspace) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[test]
+    fn test_load_nonexistent_returns_fresh() {
+        let loaded = IdMap::load("_nonexistent_workspace_that_does_not_exist_");
+        // Should return a fresh IdMap with no mappings.
+        assert_eq!(loaded.tmux_pane_id(0), None);
+        assert_eq!(loaded.tmux_window_id(0), None);
+        assert_eq!(loaded.tmux_session_id("anything"), None);
+    }
+
+    #[test]
+    fn test_id_map_path_sanitizes_workspace_name() {
+        let path = id_map_path("my workspace/special:chars").unwrap();
+        let filename = path.file_name().unwrap().to_str().unwrap();
+        assert_eq!(filename, "tmux-id-map-my_workspace_special_chars.json");
+        assert!(!filename.contains(' '));
+        assert!(!filename.contains('/'));
+        assert!(!filename.contains(':'));
     }
 }
