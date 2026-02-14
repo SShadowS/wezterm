@@ -1977,12 +1977,15 @@ pub async fn handle_split_window(
         size: split_size,
     };
 
-    let command = if !env.is_empty() {
+    let command = if !env.is_empty() || cwd.is_some() {
         let mut builder = CommandBuilder::new_default_prog();
         for kv in env {
             if let Some((k, v)) = kv.split_once('=') {
                 builder.env(k, v);
             }
+        }
+        if let Some(dir) = cwd {
+            builder.cwd(dir);
         }
         Some(builder)
     } else {
@@ -1991,7 +1994,7 @@ pub async fn handle_split_window(
 
     let source = SplitSource::Spawn {
         command,
-        command_dir: cwd.map(|s| s.to_string()),
+        command_dir: None,
     };
 
     let (new_pane, _new_size) = mux
@@ -2029,12 +2032,15 @@ pub async fn handle_new_window(
 
     let current_pane_id = resolved.pane_id;
 
-    let command = if !env.is_empty() {
+    let command = if !env.is_empty() || cwd.is_some() {
         let mut builder = CommandBuilder::new_default_prog();
         for kv in env {
             if let Some((k, v)) = kv.split_once('=') {
                 builder.env(k, v);
             }
+        }
+        if let Some(dir) = cwd {
+            builder.cwd(dir);
         }
         Some(builder)
     } else {
@@ -2046,7 +2052,7 @@ pub async fn handle_new_window(
             window_id,
             SpawnTabDomain::CurrentPaneDomain,
             command,
-            cwd.map(|s| s.to_string()),
+            None,
             TerminalSize::default(),
             current_pane_id,
             workspace,
@@ -2344,12 +2350,15 @@ pub async fn handle_new_session(
         return Err(format!("duplicate session: {}", workspace));
     }
 
-    let command = if !env.is_empty() {
+    let command = if !env.is_empty() || cwd.is_some() {
         let mut builder = CommandBuilder::new_default_prog();
         for kv in env {
             if let Some((k, v)) = kv.split_once('=') {
                 builder.env(k, v);
             }
+        }
+        if let Some(dir) = cwd {
+            builder.cwd(dir);
         }
         Some(builder)
     } else {
@@ -2361,7 +2370,7 @@ pub async fn handle_new_session(
             None, // create a new mux window
             SpawnTabDomain::CurrentPaneDomain,
             command,
-            cwd.map(|s| s.to_string()),
+            None,
             TerminalSize::default(),
             None, // no current pane
             workspace.clone(),
