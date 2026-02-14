@@ -477,7 +477,7 @@
 ## Phase 12: Advanced / Modern tmux (3.2+) Features
 
 **Priority**: MIXED — pause mode is CRITICAL, others vary
-**Status**: [ ] Not started
+**Status**: [x] Complete (all sub-phases 12.1–12.5 done)
 
 ### Verification Notes (from tmux + iTerm2 source analysis)
 
