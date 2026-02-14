@@ -105,3 +105,33 @@ These are candidates for real implementation later.
 
 **Low** (not needed for team mode):
 5. `copy-mode`, `wait-for`, `pipe-pane`, `display-popup`, `run-shell -b`, `kill-server`
+
+---
+
+## Windows-Specific: `env` command in send-keys
+
+**Not a no-op, but a compatibility gap.**
+
+Claude Code's team mode sends startup commands to panes via `send-keys` like:
+```
+send-keys -t %5 "cd /path && env CLAUDECODE=1 CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 'claude.exe' --agent-id ..." Enter
+```
+
+The `env` utility is Unix-only and doesn't exist in PowerShell. While we now pass
+`-e` env vars directly to the spawned shell process via `CommandBuilder`, the `env`
+inside the `send-keys` payload is a separate issue — it's literal text typed into the
+pane's shell.
+
+**Possible solutions:**
+1. **Intercept in send-keys handler** — Detect `env KEY=VAL ... command` patterns and
+   rewrite to PowerShell syntax (`$env:KEY='VAL'; command`) when the default shell is
+   PowerShell. Fragile but targeted.
+2. **Ship an `env.exe` shim** — Like the tmux shim, bundle a small `env.exe` that
+   parses `env KEY=VAL command args...` and executes with the environment set. Put it
+   in the tmux-compat PATH.
+3. **Upstream fix in Claude Code** — Report as a Windows bug. Claude Code should detect
+   the shell type and use appropriate syntax.
+4. **Configure WezTerm to use Git Bash** — `config.default_prog = { 'bash.exe', '-l' }`
+   would make `env` available, but changes the user's preferred shell.
+
+**Recommended**: Option 2 (ship `env.exe` shim) is the most robust and non-invasive.
