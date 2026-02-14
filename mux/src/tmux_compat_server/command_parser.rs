@@ -140,6 +140,17 @@ pub enum TmuxCliCommand {
         delete_after: bool,
         bracketed: bool,
     },
+    // Phase 12.3: move commands
+    MovePane {
+        src: Option<String>,
+        dst: Option<String>,
+        horizontal: bool,
+        before: bool,
+    },
+    MoveWindow {
+        src: Option<String>,
+        dst: Option<String>,
+    },
 }
 
 /// Parse a tmux command line into a structured [`TmuxCliCommand`].
@@ -195,6 +206,8 @@ pub fn parse_command(line: &str) -> Result<TmuxCliCommand> {
         "delete-buffer" | "deleteb" => parse_delete_buffer(args),
         "list-buffers" | "lsb" => parse_list_buffers(args),
         "paste-buffer" | "pasteb" => parse_paste_buffer(args),
+        "move-pane" | "movep" | "join-pane" | "joinp" => parse_move_pane(args),
+        "move-window" | "movew" => parse_move_window(args),
         other => bail!("unknown tmux command: {other:?}"),
     }
 }
@@ -901,6 +914,56 @@ fn parse_paste_buffer(args: &[String]) -> Result<TmuxCliCommand> {
         delete_after,
         bracketed,
     })
+}
+
+fn parse_move_pane(args: &[String]) -> Result<TmuxCliCommand> {
+    let mut src = None;
+    let mut dst = None;
+    let mut horizontal = false;
+    let mut before = false;
+
+    let strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let mut iter = strs.iter().copied();
+    while let Some(arg) = iter.next() {
+        match arg {
+            "-s" => src = Some(take_flag_value("-s", &mut iter)?),
+            "-t" => dst = Some(take_flag_value("-t", &mut iter)?),
+            "-h" => horizontal = true,
+            "-v" => {} // vertical is default, no-op
+            "-b" => before = true,
+            "-d" | "-f" => {} // accept but ignore: -d (don't focus), -f (full size)
+            "-l" | "-p" => {
+                // Accept but ignore: -l size, -p percentage
+                let _ = take_flag_value(arg, &mut iter).ok();
+            }
+            other => bail!("move-pane: unexpected argument: {other:?}"),
+        }
+    }
+
+    Ok(TmuxCliCommand::MovePane {
+        src,
+        dst,
+        horizontal,
+        before,
+    })
+}
+
+fn parse_move_window(args: &[String]) -> Result<TmuxCliCommand> {
+    let mut src = None;
+    let mut dst = None;
+
+    let strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let mut iter = strs.iter().copied();
+    while let Some(arg) = iter.next() {
+        match arg {
+            "-s" => src = Some(take_flag_value("-s", &mut iter)?),
+            "-t" => dst = Some(take_flag_value("-t", &mut iter)?),
+            "-a" | "-b" | "-d" | "-k" | "-r" => {} // accept but ignore
+            other => bail!("move-window: unexpected argument: {other:?}"),
+        }
+    }
+
+    Ok(TmuxCliCommand::MoveWindow { src, dst })
 }
 
 #[cfg(test)]
@@ -1977,6 +2040,113 @@ mod tests {
             TmuxCliCommand::ListClients {
                 format: Some("#{client_name}\t#{client_control_mode}".into()),
                 target: Some("$0".into()),
+            }
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // move-pane / join-pane
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn move_pane_basic() {
+        assert_eq!(
+            parse("move-pane -s %0 -t %1"),
+            TmuxCliCommand::MovePane {
+                src: Some("%0".into()),
+                dst: Some("%1".into()),
+                horizontal: false,
+                before: false,
+            }
+        );
+    }
+
+    #[test]
+    fn move_pane_horizontal_before() {
+        assert_eq!(
+            parse("move-pane -s %0 -t %1 -h -b"),
+            TmuxCliCommand::MovePane {
+                src: Some("%0".into()),
+                dst: Some("%1".into()),
+                horizontal: true,
+                before: true,
+            }
+        );
+    }
+
+    #[test]
+    fn join_pane_alias() {
+        assert_eq!(
+            parse("join-pane -s %3 -t %5 -v"),
+            TmuxCliCommand::MovePane {
+                src: Some("%3".into()),
+                dst: Some("%5".into()),
+                horizontal: false,
+                before: false,
+            }
+        );
+    }
+
+    #[test]
+    fn movep_alias() {
+        assert_eq!(
+            parse("movep -s %1 -t %2 -h"),
+            TmuxCliCommand::MovePane {
+                src: Some("%1".into()),
+                dst: Some("%2".into()),
+                horizontal: true,
+                before: false,
+            }
+        );
+    }
+
+    #[test]
+    fn move_pane_iterm2_style() {
+        // iTerm2 sends: move-pane -s "%0" -t "%1" -h
+        assert_eq!(
+            parse("move-pane -s \"%0\" -t \"%1\" -h"),
+            TmuxCliCommand::MovePane {
+                src: Some("%0".into()),
+                dst: Some("%1".into()),
+                horizontal: true,
+                before: false,
+            }
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // move-window
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn move_window_basic() {
+        assert_eq!(
+            parse("move-window -s $0:@1 -t $1:+"),
+            TmuxCliCommand::MoveWindow {
+                src: Some("$0:@1".into()),
+                dst: Some("$1:+".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn movew_alias() {
+        assert_eq!(
+            parse("movew -s @0 -t @1"),
+            TmuxCliCommand::MoveWindow {
+                src: Some("@0".into()),
+                dst: Some("@1".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn move_window_with_ignored_flags() {
+        assert_eq!(
+            parse("move-window -s @0 -t $1:+ -a -d -k -r"),
+            TmuxCliCommand::MoveWindow {
+                src: Some("@0".into()),
+                dst: Some("$1:+".into()),
             }
         );
     }

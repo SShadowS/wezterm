@@ -587,6 +587,15 @@ pub async fn dispatch_command(
             delete_after,
             bracketed: _,
         } => handle_paste_buffer(ctx, buffer_name.as_deref(), &target, delete_after),
+        TmuxCliCommand::MovePane {
+            src,
+            dst,
+            horizontal,
+            before,
+        } => handle_move_pane(ctx, &src, &dst, horizontal, before).await,
+        TmuxCliCommand::MoveWindow { src, dst } => {
+            handle_move_window(ctx, &src, &dst)
+        }
     }
 }
 
@@ -606,12 +615,15 @@ pub fn handle_list_commands() -> String {
         "kill-pane",
         "kill-session",
         "kill-window",
+        "join-pane",
         "list-buffers",
         "list-clients",
         "list-commands",
         "list-panes",
         "list-sessions",
         "list-windows",
+        "move-pane",
+        "move-window",
         "new-session",
         "new-window",
         "paste-buffer",
@@ -1864,6 +1876,143 @@ pub fn handle_rename_session(
     Ok(String::new())
 }
 
+/// Move a pane from one location to another (split target).
+///
+/// tmux: `move-pane -s <src> -t <dst> [-h] [-b]`
+/// Same as `join-pane`.
+pub async fn handle_move_pane(
+    ctx: &mut HandlerContext,
+    src: &Option<String>,
+    dst: &Option<String>,
+    horizontal: bool,
+    before: bool,
+) -> Result<String, String> {
+    let mux = Mux::try_get().ok_or_else(|| "mux not available".to_string())?;
+
+    // Resolve source pane (the pane being moved).
+    let src_resolved = ctx.resolve_target(src)?;
+    let src_real_pane_id = src_resolved
+        .pane_id
+        .ok_or_else(|| "no source pane resolved for move-pane".to_string())?;
+
+    // Resolve destination pane (where the source will be placed next to).
+    let dst_resolved = ctx.resolve_target(dst)?;
+    let dst_real_pane_id = dst_resolved
+        .pane_id
+        .ok_or_else(|| "no destination pane resolved for move-pane".to_string())?;
+
+    if src_real_pane_id == dst_real_pane_id {
+        return Err("source and target panes must be different".to_string());
+    }
+
+    let direction = if horizontal {
+        SplitDirection::Horizontal
+    } else {
+        SplitDirection::Vertical
+    };
+
+    let request = SplitRequest {
+        direction,
+        target_is_second: !before,
+        top_level: false,
+        size: SplitSize::Percent(50),
+    };
+
+    let source = SplitSource::MovePane(src_real_pane_id);
+
+    mux.split_pane(
+        dst_real_pane_id,
+        request,
+        source,
+        SpawnTabDomain::CurrentPaneDomain,
+    )
+    .await
+    .map_err(|e| format!("move-pane failed: {}", e))?;
+
+    Ok(String::new())
+}
+
+/// Move a window (tab) from one session to another.
+///
+/// tmux: `move-window -s <src> -t <dst>`
+///
+/// In WezTerm's model this means moving a tab from one mux Window to another.
+/// Since WezTerm workspaces don't have a fixed window-index scheme like tmux,
+/// the tab is simply removed from its current window and pushed to the target.
+pub fn handle_move_window(
+    ctx: &mut HandlerContext,
+    src: &Option<String>,
+    dst: &Option<String>,
+) -> Result<String, String> {
+    let mux = Mux::try_get().ok_or_else(|| "mux not available".to_string())?;
+
+    // Resolve source: the window (tab) to move.
+    let src_resolved = ctx.resolve_target(src)?;
+    let src_tab_id = src_resolved
+        .tab_id
+        .ok_or_else(|| "no source window resolved for move-window".to_string())?;
+
+    // Find the mux window containing this tab.
+    let (src_mux_window_id, src_tab_arc) = {
+        let mut found = None;
+        let window_ids = mux.iter_windows_in_workspace(&ctx.workspace);
+        for wid in &window_ids {
+            if let Some(win) = mux.get_window(*wid) {
+                if let Some(idx) = win.idx_by_id(src_tab_id) {
+                    // Get the tab Arc before we drop the borrow.
+                    let tab = win.get_by_idx(idx).cloned();
+                    if let Some(tab) = tab {
+                        found = Some((*wid, tab));
+                    }
+                    break;
+                }
+            }
+        }
+        found.ok_or_else(|| format!("source window @{} not found", src_tab_id))?
+    };
+
+    // Resolve destination: target window (mux Window) to move into.
+    // For move-window, the -t target typically references a session (workspace).
+    // We find the first mux Window in the target workspace.
+    let dst_resolved = ctx.resolve_target(dst)?;
+    let dst_workspace = dst_resolved
+        .workspace
+        .unwrap_or_else(|| ctx.workspace.clone());
+
+    let dst_mux_window_id = {
+        let dst_window_ids = mux.iter_windows_in_workspace(&dst_workspace);
+        if let Some(wid) = dst_window_ids.first() {
+            *wid
+        } else {
+            return Err(format!(
+                "no windows found in destination workspace '{}'",
+                dst_workspace
+            ));
+        }
+    };
+
+    if src_mux_window_id == dst_mux_window_id {
+        // Same window — nothing to do.
+        return Ok(String::new());
+    }
+
+    // Remove tab from source window.
+    {
+        if let Some(mut win) = mux.get_window_mut(src_mux_window_id) {
+            win.remove_by_id(src_tab_id);
+        }
+    }
+
+    // Add tab to destination window.
+    {
+        if let Some(mut win) = mux.get_window_mut(dst_mux_window_id) {
+            win.push(&src_tab_arc);
+        }
+    }
+
+    Ok(String::new())
+}
+
 /// Create a new session (workspace with a new window).
 pub async fn handle_new_session(
     ctx: &mut HandlerContext,
@@ -2461,7 +2610,7 @@ mod tests {
     fn list_commands_contains_all() {
         let output = handle_list_commands();
         let commands: Vec<&str> = output.lines().collect();
-        assert_eq!(commands.len(), 32);
+        assert_eq!(commands.len(), 35);
         assert!(commands.contains(&"attach-session"));
         assert!(commands.contains(&"capture-pane"));
         assert!(commands.contains(&"delete-buffer"));
@@ -2494,6 +2643,9 @@ mod tests {
         assert!(commands.contains(&"show-window-options"));
         assert!(commands.contains(&"split-window"));
         assert!(commands.contains(&"switch-client"));
+        assert!(commands.contains(&"join-pane"));
+        assert!(commands.contains(&"move-pane"));
+        assert!(commands.contains(&"move-window"));
     }
 
     #[test]

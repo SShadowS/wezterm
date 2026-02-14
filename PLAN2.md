@@ -1,7 +1,7 @@
 # PLAN2.md — Tmux CC Protocol Compatibility Roadmap
 
 **Created**: 2026-02-14
-**Status**: Active development — Phases 1-12.2 complete, Phase 12.3-12.5 remaining
+**Status**: Active development — Phases 1-12.3 complete, Phase 12.4-12.5 remaining
 
 ---
 
@@ -14,7 +14,7 @@
 - **Config option** `enable_tmux_compat = true` in `.wezterm.lua`
 - **Environment variables** `TMUX`, `WEZTERM_TMUX_CC`, `PATH` set in spawned panes
 - **Manual line-buffered I/O** on both server and shim (BufReader breaks Windows sockets)
-- **32 commands** implemented and working (16 Phase 1-5 + 7 Phase 7 + 4 Phase 8 + 5 Phase 11)
+- **35 commands** implemented and working (16 Phase 1-5 + 7 Phase 7 + 4 Phase 8 + 5 Phase 11 + 3 Phase 12.3)
 - **10 notifications** emitted (+ Phase 6 lifecycle + Phase 9 `%session-window-changed`, `%paste-buffer-changed` + Phase 11 `%paste-buffer-deleted`)
 - **36 format variables** supported with conditional syntax `#{?cond,true,false}` (20 Phase 1-5 + 13 Phase 10 + 3 Phase 11)
 
@@ -54,6 +54,9 @@
 | `delete-buffer` | `-b` | Delete buffer (Phase 11) |
 | `list-buffers` | `-F` | List buffers (Phase 11) |
 | `paste-buffer` | `-b`, `-t`, `-d`, `-p` | Paste buffer to pane (Phase 11) |
+| `move-pane` | `-s`, `-t`, `-h`, `-v`, `-b` | Move pane between split trees (Phase 12.3) |
+| `join-pane` | `-s`, `-t`, `-h`, `-v`, `-b` | Alias for move-pane (Phase 12.3) |
+| `move-window` | `-s`, `-t` | Move tab between windows (Phase 12.3) |
 
 ### Emitted Notifications (7 active + 2 defined but unused)
 
@@ -546,18 +549,18 @@ Subscriptions eliminate polling overhead. iTerm2's `iTermTmuxOptionMonitor` uses
 ### 12.3 — Move Commands (MEDIUM)
 
 **Priority**: MEDIUM — iTerm2 actively uses both for layout reorganization
-**Status**: [ ] Not started
+**Status**: [x] Complete
 
-- [ ] Add `MovePane { src: String, dst: String, horizontal: bool, before: bool }` to `TmuxCliCommand`
-- [ ] Parse `move-pane -s <src> -t <dst> [-h|-v] [-b]` (alias: `movep`)
-- [ ] Handler: remove pane from source tab, insert into destination tab's split tree
-- [ ] Add `MoveWindow { src: String, dst: String }` to `TmuxCliCommand`
-- [ ] Parse `move-window -s <src> -t <dst>` (alias: `movew`)
-- [ ] Handler: unlink tab from source window, link into destination window
-- [ ] Emit `%layout-change` for affected windows
+- [x] Add `MovePane { src, dst, horizontal, before }` to `TmuxCliCommand`
+- [x] Parse `move-pane -s <src> -t <dst> [-h|-v] [-b] [-d] [-f] [-l] [-p]` (aliases: `movep`, `join-pane`, `joinp`)
+- [x] Handler: uses `Mux::split_pane()` with `SplitSource::MovePane` — removes pane from source split tree, inserts into destination
+- [x] Add `MoveWindow { src, dst }` to `TmuxCliCommand`
+- [x] Parse `move-window -s <src> -t <dst> [-a] [-b] [-d] [-k] [-r]` (alias: `movew`)
+- [x] Handler: removes tab from source mux Window, pushes to destination mux Window
+- [x] Add `join-pane`, `move-pane`, `move-window` to `handle_list_commands` (32→35 commands)
+- [x] 8 new tests (5 parser + 3 handler list)
 - **Files**: `command_parser.rs`, `handlers.rs`
-- **Difficulty**: Medium (pane movement within split trees, tab reparenting)
-- **Note**: `move_pane_to_new_tab()` exists in `mux/src/lib.rs` — extend for between-tab movement
+- **Note**: Uses `Mux::split_pane(SplitSource::MovePane)` from `mux/src/lib.rs` which handles remove+insert+cleanup
 
 ### 12.4 — Copy Mode Bridge (LOW)
 
