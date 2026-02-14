@@ -534,6 +534,14 @@ pub struct Config {
     #[dynamic(default)]
     pub enable_zwlr_output_manager: bool,
 
+    /// Enable tmux control mode compatibility server.
+    /// When enabled, WezTerm starts a CC protocol server on a Unix socket
+    /// and sets environment variables (TMUX, PATH) in spawned shells so that
+    /// tools like Claude Code can use tmux commands natively.
+    /// The default is false.
+    #[dynamic(default)]
+    pub enable_tmux_compat: bool,
+
     /// Whether to prefer EGL over other GL implementations.
     /// EGL on Windows has jankier resize behavior than WGL (which
     /// is used if EGL is unavailable), but EGL survives graphics

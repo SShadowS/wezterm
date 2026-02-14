@@ -5,7 +5,7 @@
 //! server (Phase 3) over a Unix domain socket, sends one command, reads the
 //! `%begin`/`%end` response, prints the body to stdout, and exits.
 
-use std::io::{BufRead, BufReader, Write};
+// std::io::{Read, Write} used via UFCS in run_cc_exchange and raw_read_line.
 
 // ---------------------------------------------------------------------------
 // Command modes
@@ -102,6 +102,7 @@ struct CcResponse {
     is_error: bool,
 }
 
+#[cfg(test)]
 /// Skip the initial handshake the CC server sends when a client connects.
 ///
 /// The server sends:
@@ -111,7 +112,7 @@ struct CcResponse {
 ///
 /// We consume lines until we've seen the greeting `%end` and then drain any
 /// `%`-prefixed notification lines that follow.
-fn skip_handshake(reader: &mut impl BufRead) -> anyhow::Result<()> {
+fn skip_handshake(reader: &mut impl std::io::BufRead) -> anyhow::Result<()> {
     let mut line = String::new();
 
     // Phase 1: read until we see the greeting %end.
@@ -150,8 +151,9 @@ fn skip_handshake(reader: &mut impl BufRead) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 /// Read a single `%begin`/`%end` (or `%begin`/`%error`) response block.
-fn read_response(reader: &mut impl BufRead) -> anyhow::Result<CcResponse> {
+fn read_response(reader: &mut impl std::io::BufRead) -> anyhow::Result<CcResponse> {
     let mut line = String::new();
     let mut body = String::new();
     let mut in_block = false;
@@ -201,29 +203,150 @@ fn read_response(reader: &mut impl BufRead) -> anyhow::Result<CcResponse> {
     }
 }
 
+/// Read a single line from the stream using raw reads.
+/// Returns the line INCLUDING the trailing newline.
+fn raw_read_line(
+    stream: &mut impl std::io::Read,
+    accum: &mut String,
+    buf: &mut [u8],
+) -> anyhow::Result<String> {
+    loop {
+        if let Some(pos) = accum.find('\n') {
+            let line = accum[..=pos].to_string();
+            accum.drain(..=pos);
+            return Ok(line);
+        }
+        let n = stream.read(buf)?;
+        if n == 0 {
+            anyhow::bail!("connection closed");
+        }
+        accum.push_str(&String::from_utf8_lossy(&buf[..n]));
+    }
+}
+
+/// Run the CC protocol exchange on an already-connected stream.
+///
+/// Uses raw reads with manual line buffering — `BufReader::read_line()`
+/// blocks indefinitely on Windows TCP sockets even when data is available.
+fn run_cc_exchange(
+    mut stream: impl std::io::Read + std::io::Write,
+    command: &str,
+    verbose: bool,
+) -> anyhow::Result<CcResponse> {
+    let mut accum = String::new();
+    let mut buf = [0u8; 4096];
+
+    if verbose {
+        eprintln!("[tmux-shim] waiting for handshake...");
+    }
+    // Skip handshake: read until we see %end, then drain %-prefixed lines.
+    loop {
+        let line = raw_read_line(&mut stream, &mut accum, &mut buf)?;
+        if verbose {
+            eprintln!("[tmux-shim] hs line: {:?}", line.trim());
+        }
+        if line.trim().starts_with("%end ") {
+            break;
+        }
+    }
+    // Drain %-prefixed notification lines.
+    // Peek at accumulated data to see if more %-lines follow.
+    loop {
+        // If there's a complete line in the accumulator, check it.
+        if let Some(pos) = accum.find('\n') {
+            let peek = accum[..pos].trim_start();
+            if peek.starts_with('%') {
+                let _notification = accum[..=pos].to_string();
+                accum.drain(..=pos);
+                if verbose {
+                    eprintln!("[tmux-shim] hs notif: {:?}", _notification.trim());
+                }
+                continue;
+            }
+            // Non-% line — handshake is done.
+            break;
+        }
+        // No complete line buffered — try a non-blocking-ish read.
+        // We can't easily do non-blocking, so just break and let the
+        // command/response flow handle any remaining notifications.
+        break;
+    }
+
+    if verbose {
+        eprintln!("[tmux-shim] handshake done, sending command: {}", command);
+    }
+
+    std::io::Write::write_all(&mut stream, command.as_bytes())?;
+    std::io::Write::write_all(&mut stream, b"\n")?;
+    std::io::Write::flush(&mut stream)?;
+
+    if verbose {
+        eprintln!("[tmux-shim] waiting for response...");
+    }
+
+    // Read response using raw reads.
+    let mut body = String::new();
+    let mut in_block = false;
+    loop {
+        let line = raw_read_line(&mut stream, &mut accum, &mut buf)?;
+        let trimmed = line.trim();
+
+        if !in_block {
+            if trimmed.starts_with("%begin ") {
+                in_block = true;
+                continue;
+            }
+            // Skip notification lines before response.
+            continue;
+        }
+        if trimmed.starts_with("%end ") {
+            return Ok(CcResponse {
+                body,
+                is_error: false,
+            });
+        }
+        if trimmed.starts_with("%error ") {
+            return Ok(CcResponse {
+                body,
+                is_error: true,
+            });
+        }
+        body.push_str(&line);
+    }
+}
+
 /// Connect to the CC server, send a command, and return the response.
+///
+/// Supports two address formats in `WEZTERM_TMUX_CC`:
+/// - `tcp:HOST:PORT` — connect via TCP (used on Windows)
+/// - anything else — treat as a Unix domain socket path
 fn execute_command(socket_path: &str, command: &str) -> anyhow::Result<CcResponse> {
-    let stream = wezterm_uds::UnixStream::connect(socket_path).map_err(|e| {
-        anyhow::anyhow!(
-            "failed to connect to WezTerm CC server at {}: {}",
-            socket_path,
-            e
-        )
-    })?;
+    let verbose = std::env::var("WEZTERM_TMUX_CC_VERBOSE").is_ok();
 
-    let mut reader = BufReader::new(stream.try_clone()?);
-    let mut writer = stream;
 
-    // Skip the initial handshake.
-    skip_handshake(&mut reader)?;
-
-    // Send the command.
-    writer.write_all(command.as_bytes())?;
-    writer.write_all(b"\n")?;
-    writer.flush()?;
-
-    // Read the response.
-    read_response(&mut reader)
+    if let Some(addr) = socket_path.strip_prefix("tcp:") {
+        let stream = std::net::TcpStream::connect(addr).map_err(|e| {
+            anyhow::anyhow!("failed to connect to WezTerm CC server at {}: {}", addr, e)
+        })?;
+        // Disable Nagle to avoid delayed-ACK stalls on Windows localhost.
+        let _ = stream.set_nodelay(true);
+        if verbose {
+            eprintln!("[tmux-shim] connected via TCP (nodelay)");
+        }
+        run_cc_exchange(stream, command, verbose)
+    } else {
+        let stream = wezterm_uds::UnixStream::connect(socket_path).map_err(|e| {
+            anyhow::anyhow!(
+                "failed to connect to WezTerm CC server at {}: {}",
+                socket_path,
+                e
+            )
+        })?;
+        if verbose {
+            eprintln!("[tmux-shim] connected via UDS");
+        }
+        run_cc_exchange(stream, command, verbose)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -326,6 +449,7 @@ fn run(args: &[String]) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::BufRead;
 
     fn args(s: &[&str]) -> Vec<String> {
         s.iter().map(|x| x.to_string()).collect()

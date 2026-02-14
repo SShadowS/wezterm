@@ -60,6 +60,7 @@ pub enum TmuxCliCommand {
         target: Option<String>,
         width: Option<u64>,
         height: Option<u64>,
+        zoom: bool,
     },
     ResizeWindow {
         target: Option<String>,
@@ -78,6 +79,44 @@ pub enum TmuxCliCommand {
         target: Option<String>,
     },
     ListCommands,
+    KillWindow {
+        target: Option<String>,
+    },
+    KillSession {
+        target: Option<String>,
+    },
+    RenameWindow {
+        target: Option<String>,
+        name: String,
+    },
+    RenameSession {
+        target: Option<String>,
+        name: String,
+    },
+    NewSession {
+        name: Option<String>,
+    },
+    ShowOptions {
+        global: bool,
+        value_only: bool,
+        option_name: Option<String>,
+    },
+    ShowWindowOptions {
+        global: bool,
+        value_only: bool,
+        option_name: Option<String>,
+    },
+    AttachSession {
+        target: Option<String>,
+    },
+    DetachClient,
+    SwitchClient {
+        target: Option<String>,
+    },
+    ListClients {
+        format: Option<String>,
+        target: Option<String>,
+    },
 }
 
 /// Parse a tmux command line into a structured [`TmuxCliCommand`].
@@ -111,12 +150,23 @@ pub fn parse_command(line: &str) -> Result<TmuxCliCommand> {
         "select-window" => parse_select_window(args),
         "select-pane" => parse_select_pane(args),
         "kill-pane" => parse_kill_pane(args),
-        "resize-pane" => parse_resize_pane(args),
+        "resize-pane" | "resizep" => parse_resize_pane(args),
         "resize-window" => parse_resize_window(args),
         "refresh-client" => parse_refresh_client(args),
         "display-message" => parse_display_message(args),
         "has-session" => parse_has_session(args),
-        "list-commands" => Ok(TmuxCliCommand::ListCommands),
+        "list-commands" | "lscm" => Ok(TmuxCliCommand::ListCommands),
+        "kill-window" | "killw" => parse_kill_window(args),
+        "kill-session" => parse_kill_session(args),
+        "rename-window" | "renamew" => parse_rename_window(args),
+        "rename-session" | "rename" => parse_rename_session(args),
+        "new-session" | "new" => parse_new_session(args),
+        "show-options" | "show" | "show-option" => parse_show_options(args),
+        "show-window-options" | "showw" | "show-window-option" => parse_show_window_options(args),
+        "attach-session" | "attach" => parse_attach_session(args),
+        "detach-client" | "detach" => parse_detach_client(args),
+        "switch-client" | "switchc" => parse_switch_client(args),
+        "list-clients" | "lsc" => parse_list_clients(args),
         other => bail!("unknown tmux command: {other:?}"),
     }
 }
@@ -363,12 +413,14 @@ fn parse_resize_pane(args: &[String]) -> Result<TmuxCliCommand> {
     let mut target = None;
     let mut width = None;
     let mut height = None;
+    let mut zoom = false;
 
     let strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     let mut iter = strs.iter().copied();
     while let Some(arg) = iter.next() {
         match arg {
             "-t" => target = Some(take_flag_value("-t", &mut iter)?),
+            "-Z" => zoom = true,
             "-x" => {
                 let val = take_flag_value("-x", &mut iter)?;
                 width = Some(
@@ -391,6 +443,7 @@ fn parse_resize_pane(args: &[String]) -> Result<TmuxCliCommand> {
         target,
         width,
         height,
+        zoom,
     })
 }
 
@@ -479,6 +532,212 @@ fn parse_has_session(args: &[String]) -> Result<TmuxCliCommand> {
     }
 
     Ok(TmuxCliCommand::HasSession { target })
+}
+
+fn parse_kill_window(args: &[String]) -> Result<TmuxCliCommand> {
+    let mut target = None;
+
+    let strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let mut iter = strs.iter().copied();
+    while let Some(arg) = iter.next() {
+        match arg {
+            "-t" => target = Some(take_flag_value("-t", &mut iter)?),
+            other => bail!("kill-window: unexpected argument: {other:?}"),
+        }
+    }
+
+    Ok(TmuxCliCommand::KillWindow { target })
+}
+
+fn parse_kill_session(args: &[String]) -> Result<TmuxCliCommand> {
+    let mut target = None;
+
+    let strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let mut iter = strs.iter().copied();
+    while let Some(arg) = iter.next() {
+        match arg {
+            "-t" => target = Some(take_flag_value("-t", &mut iter)?),
+            other => bail!("kill-session: unexpected argument: {other:?}"),
+        }
+    }
+
+    Ok(TmuxCliCommand::KillSession { target })
+}
+
+fn parse_rename_window(args: &[String]) -> Result<TmuxCliCommand> {
+    let mut target = None;
+    let mut name = None;
+
+    let strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let mut iter = strs.iter().copied();
+    while let Some(arg) = iter.next() {
+        match arg {
+            "-t" => target = Some(take_flag_value("-t", &mut iter)?),
+            _ => {
+                // Positional argument: the new name
+                name = Some(arg.to_string());
+            }
+        }
+    }
+
+    let name = name.ok_or_else(|| anyhow::anyhow!("rename-window: missing new name"))?;
+    Ok(TmuxCliCommand::RenameWindow { target, name })
+}
+
+fn parse_rename_session(args: &[String]) -> Result<TmuxCliCommand> {
+    let mut target = None;
+    let mut name = None;
+
+    let strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let mut iter = strs.iter().copied();
+    while let Some(arg) = iter.next() {
+        match arg {
+            "-t" => target = Some(take_flag_value("-t", &mut iter)?),
+            _ => {
+                // Positional argument: the new name
+                name = Some(arg.to_string());
+            }
+        }
+    }
+
+    let name = name.ok_or_else(|| anyhow::anyhow!("rename-session: missing new name"))?;
+    Ok(TmuxCliCommand::RenameSession { target, name })
+}
+
+fn parse_new_session(args: &[String]) -> Result<TmuxCliCommand> {
+    let mut name = None;
+
+    let strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let mut iter = strs.iter().copied();
+    while let Some(arg) = iter.next() {
+        match arg {
+            "-s" => name = Some(take_flag_value("-s", &mut iter)?),
+            other => bail!("new-session: unexpected argument: {other:?}"),
+        }
+    }
+
+    Ok(TmuxCliCommand::NewSession { name })
+}
+
+fn parse_show_options(args: &[String]) -> Result<TmuxCliCommand> {
+    let mut global = false;
+    let mut value_only = false;
+    let mut option_name = None;
+
+    let strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let mut iter = strs.iter().copied();
+    while let Some(arg) = iter.next() {
+        match arg {
+            "-g" => global = true,
+            "-v" => value_only = true,
+            "-gv" | "-vg" => {
+                global = true;
+                value_only = true;
+            }
+            _ => {
+                option_name = Some(arg.to_string());
+            }
+        }
+    }
+
+    Ok(TmuxCliCommand::ShowOptions {
+        global,
+        value_only,
+        option_name,
+    })
+}
+
+fn parse_show_window_options(args: &[String]) -> Result<TmuxCliCommand> {
+    let mut global = false;
+    let mut value_only = false;
+    let mut option_name = None;
+
+    let strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let mut iter = strs.iter().copied();
+    while let Some(arg) = iter.next() {
+        match arg {
+            "-g" => global = true,
+            "-v" => value_only = true,
+            "-gv" | "-vg" => {
+                global = true;
+                value_only = true;
+            }
+            _ => {
+                option_name = Some(arg.to_string());
+            }
+        }
+    }
+
+    Ok(TmuxCliCommand::ShowWindowOptions {
+        global,
+        value_only,
+        option_name,
+    })
+}
+
+fn parse_attach_session(args: &[String]) -> Result<TmuxCliCommand> {
+    let mut target = None;
+
+    let strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let mut iter = strs.iter().copied();
+    while let Some(arg) = iter.next() {
+        match arg {
+            "-t" => target = Some(take_flag_value("-t", &mut iter)?),
+            other => bail!("attach-session: unexpected argument: {other:?}"),
+        }
+    }
+
+    Ok(TmuxCliCommand::AttachSession { target })
+}
+
+fn parse_detach_client(args: &[String]) -> Result<TmuxCliCommand> {
+    // detach-client accepts -t (target client) and -s (target session) but
+    // for CC mode we only need the bare command — ignore flags gracefully.
+    let strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let mut iter = strs.iter().copied();
+    while let Some(arg) = iter.next() {
+        match arg {
+            "-t" | "-s" => {
+                // Consume and ignore the value
+                let _ = take_flag_value(arg, &mut iter)?;
+            }
+            other => bail!("detach-client: unexpected argument: {other:?}"),
+        }
+    }
+
+    Ok(TmuxCliCommand::DetachClient)
+}
+
+fn parse_switch_client(args: &[String]) -> Result<TmuxCliCommand> {
+    let mut target = None;
+
+    let strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let mut iter = strs.iter().copied();
+    while let Some(arg) = iter.next() {
+        match arg {
+            "-t" => target = Some(take_flag_value("-t", &mut iter)?),
+            other => bail!("switch-client: unexpected argument: {other:?}"),
+        }
+    }
+
+    Ok(TmuxCliCommand::SwitchClient { target })
+}
+
+fn parse_list_clients(args: &[String]) -> Result<TmuxCliCommand> {
+    let mut format = None;
+    let mut target = None;
+
+    let strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let mut iter = strs.iter().copied();
+    while let Some(arg) = iter.next() {
+        match arg {
+            "-F" => format = Some(take_flag_value("-F", &mut iter)?),
+            "-t" => target = Some(take_flag_value("-t", &mut iter)?),
+            other => bail!("list-clients: unexpected argument: {other:?}"),
+        }
+    }
+
+    Ok(TmuxCliCommand::ListClients { format, target })
 }
 
 #[cfg(test)]
@@ -835,6 +1094,7 @@ mod tests {
                 target: Some("%1".into()),
                 width: Some(80),
                 height: Some(24),
+                zoom: false,
             }
         );
     }
@@ -847,6 +1107,7 @@ mod tests {
                 target: None,
                 width: Some(120),
                 height: None,
+                zoom: false,
             }
         );
     }
@@ -1037,6 +1298,451 @@ mod tests {
                 literal: false,
                 hex: false,
                 keys: vec!["ls -la".into(), "Enter".into()],
+            }
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // resize-pane -Z (zoom)
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn resize_pane_zoom() {
+        assert_eq!(
+            parse("resize-pane -Z -t %1"),
+            TmuxCliCommand::ResizePane {
+                target: Some("%1".into()),
+                width: None,
+                height: None,
+                zoom: true,
+            }
+        );
+    }
+
+    #[test]
+    fn resize_pane_zoom_no_target() {
+        assert_eq!(
+            parse("resize-pane -Z"),
+            TmuxCliCommand::ResizePane {
+                target: None,
+                width: None,
+                height: None,
+                zoom: true,
+            }
+        );
+    }
+
+    #[test]
+    fn resize_pane_alias_resizep() {
+        assert_eq!(
+            parse("resizep -Z"),
+            TmuxCliCommand::ResizePane {
+                target: None,
+                width: None,
+                height: None,
+                zoom: true,
+            }
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // kill-window
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn kill_window_with_target() {
+        assert_eq!(
+            parse("kill-window -t @1"),
+            TmuxCliCommand::KillWindow {
+                target: Some("@1".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn kill_window_no_args() {
+        assert_eq!(
+            parse("kill-window"),
+            TmuxCliCommand::KillWindow { target: None }
+        );
+    }
+
+    #[test]
+    fn kill_window_alias_killw() {
+        assert_eq!(
+            parse("killw -t @2"),
+            TmuxCliCommand::KillWindow {
+                target: Some("@2".into()),
+            }
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // kill-session
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn kill_session_with_target() {
+        assert_eq!(
+            parse("kill-session -t mysession"),
+            TmuxCliCommand::KillSession {
+                target: Some("mysession".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn kill_session_no_args() {
+        assert_eq!(
+            parse("kill-session"),
+            TmuxCliCommand::KillSession { target: None }
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // rename-window
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn rename_window_with_target() {
+        assert_eq!(
+            parse("rename-window -t @0 editor"),
+            TmuxCliCommand::RenameWindow {
+                target: Some("@0".into()),
+                name: "editor".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn rename_window_name_only() {
+        assert_eq!(
+            parse("rename-window mywin"),
+            TmuxCliCommand::RenameWindow {
+                target: None,
+                name: "mywin".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn rename_window_alias_renamew() {
+        assert_eq!(
+            parse("renamew newname"),
+            TmuxCliCommand::RenameWindow {
+                target: None,
+                name: "newname".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn rename_window_missing_name_is_error() {
+        assert!(parse_command("rename-window").is_err());
+    }
+
+    // ---------------------------------------------------------------
+    // rename-session
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn rename_session_with_target() {
+        assert_eq!(
+            parse("rename-session -t $0 newname"),
+            TmuxCliCommand::RenameSession {
+                target: Some("$0".into()),
+                name: "newname".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn rename_session_name_only() {
+        assert_eq!(
+            parse("rename-session work"),
+            TmuxCliCommand::RenameSession {
+                target: None,
+                name: "work".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn rename_session_alias_rename() {
+        assert_eq!(
+            parse("rename newname"),
+            TmuxCliCommand::RenameSession {
+                target: None,
+                name: "newname".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn rename_session_missing_name_is_error() {
+        assert!(parse_command("rename-session").is_err());
+    }
+
+    // ---------------------------------------------------------------
+    // new-session
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn new_session_with_name() {
+        assert_eq!(
+            parse("new-session -s work"),
+            TmuxCliCommand::NewSession {
+                name: Some("work".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn new_session_no_args() {
+        assert_eq!(
+            parse("new-session"),
+            TmuxCliCommand::NewSession { name: None }
+        );
+    }
+
+    #[test]
+    fn new_session_alias_new() {
+        assert_eq!(
+            parse("new -s dev"),
+            TmuxCliCommand::NewSession {
+                name: Some("dev".into()),
+            }
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // show-options
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn show_options_global_value() {
+        assert_eq!(
+            parse("show-options -gv default-terminal"),
+            TmuxCliCommand::ShowOptions {
+                global: true,
+                value_only: true,
+                option_name: Some("default-terminal".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn show_options_global_only() {
+        assert_eq!(
+            parse("show-options -g"),
+            TmuxCliCommand::ShowOptions {
+                global: true,
+                value_only: false,
+                option_name: None,
+            }
+        );
+    }
+
+    #[test]
+    fn show_options_alias_show() {
+        assert_eq!(
+            parse("show -gv escape-time"),
+            TmuxCliCommand::ShowOptions {
+                global: true,
+                value_only: true,
+                option_name: Some("escape-time".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn show_options_separate_flags() {
+        assert_eq!(
+            parse("show-options -g -v set-clipboard"),
+            TmuxCliCommand::ShowOptions {
+                global: true,
+                value_only: true,
+                option_name: Some("set-clipboard".into()),
+            }
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // show-window-options
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn show_window_options_global_value() {
+        assert_eq!(
+            parse("show-window-options -gv aggressive-resize"),
+            TmuxCliCommand::ShowWindowOptions {
+                global: true,
+                value_only: true,
+                option_name: Some("aggressive-resize".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn show_window_options_alias_showw() {
+        assert_eq!(
+            parse("showw -gv aggressive-resize"),
+            TmuxCliCommand::ShowWindowOptions {
+                global: true,
+                value_only: true,
+                option_name: Some("aggressive-resize".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn show_window_options_no_args() {
+        assert_eq!(
+            parse("show-window-options"),
+            TmuxCliCommand::ShowWindowOptions {
+                global: false,
+                value_only: false,
+                option_name: None,
+            }
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // attach-session
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn attach_session_with_target() {
+        assert_eq!(
+            parse("attach-session -t work"),
+            TmuxCliCommand::AttachSession {
+                target: Some("work".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn attach_session_no_args() {
+        assert_eq!(
+            parse("attach-session"),
+            TmuxCliCommand::AttachSession { target: None }
+        );
+    }
+
+    #[test]
+    fn attach_session_alias_attach() {
+        assert_eq!(
+            parse("attach -t $1"),
+            TmuxCliCommand::AttachSession {
+                target: Some("$1".into()),
+            }
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // detach-client
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn detach_client_no_args() {
+        assert_eq!(parse("detach-client"), TmuxCliCommand::DetachClient);
+    }
+
+    #[test]
+    fn detach_client_alias_detach() {
+        assert_eq!(parse("detach"), TmuxCliCommand::DetachClient);
+    }
+
+    #[test]
+    fn detach_client_with_ignored_flags() {
+        // -t and -s are accepted but ignored in CC mode
+        assert_eq!(
+            parse("detach-client -t myclient"),
+            TmuxCliCommand::DetachClient
+        );
+        assert_eq!(
+            parse("detach-client -s mysession"),
+            TmuxCliCommand::DetachClient
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // switch-client
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn switch_client_with_target() {
+        assert_eq!(
+            parse("switch-client -t work"),
+            TmuxCliCommand::SwitchClient {
+                target: Some("work".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn switch_client_no_args() {
+        assert_eq!(
+            parse("switch-client"),
+            TmuxCliCommand::SwitchClient { target: None }
+        );
+    }
+
+    #[test]
+    fn switch_client_alias_switchc() {
+        assert_eq!(
+            parse("switchc -t $0"),
+            TmuxCliCommand::SwitchClient {
+                target: Some("$0".into()),
+            }
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // list-clients
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn list_clients_no_args() {
+        assert_eq!(
+            parse("list-clients"),
+            TmuxCliCommand::ListClients {
+                format: None,
+                target: None,
+            }
+        );
+    }
+
+    #[test]
+    fn list_clients_with_format_and_target() {
+        assert_eq!(
+            parse("list-clients -t $0 -F '#{client_name}'"),
+            TmuxCliCommand::ListClients {
+                format: Some("#{client_name}".into()),
+                target: Some("$0".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn list_clients_alias_lsc() {
+        assert_eq!(
+            parse("lsc -F '#{client_name}\t#{client_control_mode}'"),
+            TmuxCliCommand::ListClients {
+                format: Some("#{client_name}\t#{client_control_mode}".into()),
+                target: None,
+            }
+        );
+    }
+
+    #[test]
+    fn list_clients_iterm2_style() {
+        // iTerm2 sends: list-clients -t '$0' -F '#{client_name}\t#{client_control_mode}'
+        assert_eq!(
+            parse("list-clients -t '$0' -F '#{client_name}\t#{client_control_mode}'"),
+            TmuxCliCommand::ListClients {
+                format: Some("#{client_name}\t#{client_control_mode}".into()),
+                target: Some("$0".into()),
             }
         );
     }

@@ -28,6 +28,29 @@ pub struct FormatContext {
     pub cursor_y: u64,
     pub history_limit: u64,
     pub history_size: u64,
+    // Phase 10: additional format variables
+    pub pane_title: String,
+    pub pane_current_command: String,
+    pub pane_current_path: String,
+    pub pane_pid: u64,
+    pub pane_mode: String,
+    pub window_flags: String,
+    pub window_panes: u64,
+    pub session_windows: u64,
+    pub session_attached: u64,
+    pub client_name: String,
+    pub socket_path: String,
+    pub server_pid: u64,
+}
+
+impl FormatContext {
+    /// Set the window as active and prepend `*` to window_flags.
+    pub fn set_window_active(&mut self, active: bool) {
+        self.window_active = active;
+        if active && !self.window_flags.contains('*') {
+            self.window_flags.insert(0, '*');
+        }
+    }
 }
 
 /// Expand a tmux format string, substituting `#{variable}` placeholders
@@ -225,6 +248,46 @@ fn resolve_variable(name: &str, ctx: &FormatContext, output: &mut String) {
         "history_size" => {
             let _ = write!(output, "{}", ctx.history_size);
         }
+        // Phase 10: additional format variables
+        "pane_title" => {
+            output.push_str(&ctx.pane_title);
+        }
+        "pane_current_command" => {
+            output.push_str(&ctx.pane_current_command);
+        }
+        "pane_current_path" => {
+            output.push_str(&ctx.pane_current_path);
+        }
+        "pane_pid" => {
+            let _ = write!(output, "{}", ctx.pane_pid);
+        }
+        "pane_mode" => {
+            output.push_str(&ctx.pane_mode);
+        }
+        "window_flags" => {
+            output.push_str(&ctx.window_flags);
+        }
+        "window_panes" => {
+            let _ = write!(output, "{}", ctx.window_panes);
+        }
+        "session_windows" => {
+            let _ = write!(output, "{}", ctx.session_windows);
+        }
+        "session_attached" => {
+            let _ = write!(output, "{}", ctx.session_attached);
+        }
+        "client_name" => {
+            output.push_str(&ctx.client_name);
+        }
+        "socket_path" => {
+            output.push_str(&ctx.socket_path);
+        }
+        "version" => {
+            output.push_str("3.3a");
+        }
+        "pid" => {
+            let _ = write!(output, "{}", ctx.server_pid);
+        }
         _ => {
             // Unknown variable — expand to empty string.
         }
@@ -258,6 +321,18 @@ mod tests {
             cursor_y: 7,
             history_limit: 2000,
             history_size: 150,
+            pane_title: "~/project".to_string(),
+            pane_current_command: "vim".to_string(),
+            pane_current_path: "/home/user/project".to_string(),
+            pane_pid: 12345,
+            pane_mode: String::new(),
+            window_flags: "*".to_string(),
+            window_panes: 2,
+            session_windows: 3,
+            session_attached: 1,
+            client_name: "/dev/pts/0".to_string(),
+            socket_path: "/tmp/tmux-1000/default".to_string(),
+            server_pid: 9999,
         }
     }
 
@@ -498,5 +573,124 @@ mod tests {
         let ctx = test_ctx();
         // Unknown variable resolves to "" which is falsy.
         assert_eq!(expand_format("#{?nonexistent,yes,no}", &ctx), "no");
+    }
+
+    // --- Phase 10: new format variable tests ---
+
+    #[test]
+    fn phase10_version() {
+        let ctx = test_ctx();
+        assert_eq!(expand_format("#{version}", &ctx), "3.3a");
+    }
+
+    #[test]
+    fn phase10_pid() {
+        let ctx = test_ctx();
+        assert_eq!(expand_format("#{pid}", &ctx), "9999");
+    }
+
+    #[test]
+    fn phase10_client_name() {
+        let ctx = test_ctx();
+        assert_eq!(expand_format("#{client_name}", &ctx), "/dev/pts/0");
+    }
+
+    #[test]
+    fn phase10_socket_path() {
+        let ctx = test_ctx();
+        assert_eq!(
+            expand_format("#{socket_path}", &ctx),
+            "/tmp/tmux-1000/default"
+        );
+    }
+
+    #[test]
+    fn phase10_pane_title() {
+        let ctx = test_ctx();
+        assert_eq!(expand_format("#{pane_title}", &ctx), "~/project");
+    }
+
+    #[test]
+    fn phase10_pane_current_command() {
+        let ctx = test_ctx();
+        assert_eq!(expand_format("#{pane_current_command}", &ctx), "vim");
+    }
+
+    #[test]
+    fn phase10_pane_current_path() {
+        let ctx = test_ctx();
+        assert_eq!(
+            expand_format("#{pane_current_path}", &ctx),
+            "/home/user/project"
+        );
+    }
+
+    #[test]
+    fn phase10_pane_pid() {
+        let ctx = test_ctx();
+        assert_eq!(expand_format("#{pane_pid}", &ctx), "12345");
+    }
+
+    #[test]
+    fn phase10_pane_mode_empty() {
+        let ctx = test_ctx();
+        // No mode infrastructure — always empty
+        assert_eq!(expand_format("#{pane_mode}", &ctx), "");
+    }
+
+    #[test]
+    fn phase10_window_flags() {
+        let ctx = test_ctx();
+        assert_eq!(expand_format("#{window_flags}", &ctx), "*");
+    }
+
+    #[test]
+    fn phase10_window_panes() {
+        let ctx = test_ctx();
+        assert_eq!(expand_format("#{window_panes}", &ctx), "2");
+    }
+
+    #[test]
+    fn phase10_session_windows() {
+        let ctx = test_ctx();
+        assert_eq!(expand_format("#{session_windows}", &ctx), "3");
+    }
+
+    #[test]
+    fn phase10_session_attached() {
+        let ctx = test_ctx();
+        assert_eq!(expand_format("#{session_attached}", &ctx), "1");
+    }
+
+    #[test]
+    fn phase10_pane_mode_conditional() {
+        // pane_mode is empty → falsy in conditional
+        let ctx = test_ctx();
+        assert_eq!(
+            expand_format("#{?pane_mode,in-mode,normal}", &ctx),
+            "normal"
+        );
+    }
+
+    #[test]
+    fn phase10_iterm2_version_detection() {
+        // iTerm2 sends: display-message -p "#{version}"
+        let ctx = test_ctx();
+        assert_eq!(expand_format("#{version}", &ctx), "3.3a");
+    }
+
+    #[test]
+    fn phase10_iterm2_window_listing_format() {
+        // Subset of the format iTerm2 uses in list-windows
+        let ctx = FormatContext {
+            window_id: 2,
+            window_name: "editor".to_string(),
+            window_flags: "*Z".to_string(),
+            window_panes: 3,
+            window_active: true,
+            ..Default::default()
+        };
+        let fmt = "#{window_id} #{window_name}#{window_flags} (#{window_panes} panes)";
+        assert_eq!(expand_format(fmt, &ctx), "@2 editor*Z (3 panes)");
     }
 }

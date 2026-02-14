@@ -4,12 +4,14 @@
 //! Tmux uses prefixed IDs: `%N` (panes), `@N` (windows), `$N` (sessions).
 //! This module provides O(1) bidirectional lookups between the two.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// WezTerm's PaneId type
 pub type PaneId = usize;
 /// WezTerm's TabId type
 pub type TabId = usize;
+/// WezTerm's mux WindowId type (distinct from tmux window IDs)
+pub type MuxWindowId = usize;
 
 /// Bidirectional mapping between WezTerm IDs and tmux IDs.
 pub struct IdMap {
@@ -27,6 +29,10 @@ pub struct IdMap {
     workspace_to_tmux_session: HashMap<String, u64>,
     tmux_to_workspace: HashMap<u64, String>,
     next_session_id: u64,
+
+    // mux window tracking (for %window-close and %sessions-changed)
+    mux_window_tabs: HashMap<MuxWindowId, HashSet<TabId>>,
+    mux_window_workspace: HashMap<MuxWindowId, String>,
 }
 
 impl IdMap {
@@ -43,6 +49,9 @@ impl IdMap {
             workspace_to_tmux_session: HashMap::new(),
             tmux_to_workspace: HashMap::new(),
             next_session_id: 0,
+
+            mux_window_tabs: HashMap::new(),
+            mux_window_workspace: HashMap::new(),
         }
     }
 
@@ -139,6 +148,67 @@ impl IdMap {
         if let Some(tmux_id) = self.workspace_to_tmux_session.remove(workspace) {
             self.tmux_to_workspace.remove(&tmux_id);
         }
+    }
+
+    /// Rename a session: re-key the workspace mapping, preserving the tmux session ID.
+    /// Returns the tmux session ID if the old workspace was known, or `None`.
+    pub fn rename_session(&mut self, old_workspace: &str, new_workspace: &str) -> Option<u64> {
+        let tmux_id = self.workspace_to_tmux_session.remove(old_workspace)?;
+        self.workspace_to_tmux_session
+            .insert(new_workspace.to_string(), tmux_id);
+        self.tmux_to_workspace
+            .insert(tmux_id, new_workspace.to_string());
+        // Update mux_window_workspace entries that referenced the old name
+        for ws in self.mux_window_workspace.values_mut() {
+            if ws == old_workspace {
+                *ws = new_workspace.to_string();
+            }
+        }
+        Some(tmux_id)
+    }
+
+    // --- Mux window tracking (for %window-close and %sessions-changed) ---
+
+    /// Record that a tab belongs to a mux window in a given workspace.
+    pub fn track_tab_in_window(
+        &mut self,
+        mux_window_id: MuxWindowId,
+        tab_id: TabId,
+        workspace: &str,
+    ) {
+        self.mux_window_tabs
+            .entry(mux_window_id)
+            .or_default()
+            .insert(tab_id);
+        self.mux_window_workspace
+            .entry(mux_window_id)
+            .or_insert_with(|| workspace.to_string());
+    }
+
+    /// Record a mux window's workspace (called on WindowCreated).
+    pub fn track_mux_window_workspace(&mut self, mux_window_id: MuxWindowId, workspace: &str) {
+        self.mux_window_workspace
+            .insert(mux_window_id, workspace.to_string());
+    }
+
+    /// Get the workspace name for a mux window.
+    pub fn mux_window_workspace(&self, mux_window_id: MuxWindowId) -> Option<&str> {
+        self.mux_window_workspace
+            .get(&mux_window_id)
+            .map(|s| s.as_str())
+    }
+
+    /// Get the set of tab IDs tracked for a mux window.
+    pub fn tabs_in_mux_window(&self, mux_window_id: MuxWindowId) -> Option<&HashSet<TabId>> {
+        self.mux_window_tabs.get(&mux_window_id)
+    }
+
+    /// Remove all tracking for a mux window, returning the tab IDs that were in it.
+    pub fn remove_mux_window(&mut self, mux_window_id: MuxWindowId) -> HashSet<TabId> {
+        self.mux_window_workspace.remove(&mux_window_id);
+        self.mux_window_tabs
+            .remove(&mux_window_id)
+            .unwrap_or_default()
     }
 }
 
@@ -266,5 +336,66 @@ mod tests {
             assert_eq!(map.wezterm_pane_id(i as u64), Some(i));
             assert_eq!(map.tmux_pane_id(i), Some(i as u64));
         }
+    }
+
+    #[test]
+    fn test_rename_session() {
+        let mut map = IdMap::new();
+        let sid = map.get_or_create_tmux_session_id("old");
+        assert_eq!(sid, 0);
+        let result = map.rename_session("old", "new");
+        assert_eq!(result, Some(0));
+        // Old name gone, new name points to same ID
+        assert_eq!(map.tmux_session_id("old"), None);
+        assert_eq!(map.tmux_session_id("new"), Some(0));
+        assert_eq!(map.workspace_name(0), Some("new"));
+    }
+
+    #[test]
+    fn test_rename_session_unknown() {
+        let mut map = IdMap::new();
+        assert_eq!(map.rename_session("nonexistent", "new"), None);
+    }
+
+    #[test]
+    fn test_track_tab_in_window() {
+        let mut map = IdMap::new();
+        map.track_tab_in_window(1, 10, "default");
+        map.track_tab_in_window(1, 20, "default");
+        let tabs = map.tabs_in_mux_window(1).unwrap();
+        assert!(tabs.contains(&10));
+        assert!(tabs.contains(&20));
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(map.mux_window_workspace(1), Some("default"));
+    }
+
+    #[test]
+    fn test_remove_mux_window() {
+        let mut map = IdMap::new();
+        map.track_tab_in_window(1, 10, "default");
+        map.track_tab_in_window(1, 20, "default");
+        let removed = map.remove_mux_window(1);
+        assert!(removed.contains(&10));
+        assert!(removed.contains(&20));
+        assert!(map.tabs_in_mux_window(1).is_none());
+        assert!(map.mux_window_workspace(1).is_none());
+    }
+
+    #[test]
+    fn test_remove_mux_window_unknown() {
+        let mut map = IdMap::new();
+        let removed = map.remove_mux_window(999);
+        assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn test_rename_session_updates_mux_window_workspace() {
+        let mut map = IdMap::new();
+        map.get_or_create_tmux_session_id("old");
+        map.track_mux_window_workspace(1, "old");
+        map.track_mux_window_workspace(2, "old");
+        map.rename_session("old", "new");
+        assert_eq!(map.mux_window_workspace(1), Some("new"));
+        assert_eq!(map.mux_window_workspace(2), Some("new"));
     }
 }

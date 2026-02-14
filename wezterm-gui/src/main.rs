@@ -420,6 +420,27 @@ async fn async_run_terminal_gui(
         log::warn!("{:#}", err);
     }
 
+    // Start tmux CC compat server if enabled
+    {
+        let config = config::configuration();
+        if config.enable_tmux_compat {
+            log::info!("tmux compat mode is enabled");
+            let tmux_cc_path =
+                config::RUNTIME_DIR.join(format!("tmux-cc-{}", unsafe { libc::getpid() }));
+            match mux::tmux_compat_server::server::start_tmux_compat_listener(&tmux_cc_path) {
+                Ok(addr) => {
+                    std::env::set_var("WEZTERM_TMUX_CC", &addr);
+                    log::info!("WEZTERM_TMUX_CC={}", addr);
+                }
+                Err(err) => {
+                    log::warn!("Failed to start tmux CC compat server: {:#}", err);
+                }
+            }
+        } else {
+            log::debug!("tmux compat mode is disabled");
+        }
+    }
+
     if !opts.no_auto_connect {
         connect_to_auto_connect_domains().await?;
     }

@@ -7,9 +7,6 @@
 
 use std::sync::Arc;
 
-use futures::FutureExt;
-use smol::prelude::*;
-
 use crate::tab::{PositionedPane, Tab};
 use crate::{Mux, MuxNotification};
 
@@ -17,20 +14,13 @@ use super::command_parser::parse_command;
 use super::handlers::{dispatch_command, HandlerContext};
 use super::layout::{generate_layout_string, LayoutNode};
 use super::response::{
-    exit_notification, layout_change_notification, session_changed_notification,
-    window_add_notification, window_pane_changed_notification, window_renamed_notification,
-    ResponseWriter,
+    exit_notification, layout_change_notification, paste_buffer_changed_notification,
+    session_changed_notification, session_renamed_notification,
+    session_window_changed_notification, sessions_changed_notification,
+    window_add_notification, window_close_notification, window_pane_changed_notification,
+    window_renamed_notification, ResponseWriter,
 };
 
-// ---------------------------------------------------------------------------
-// CC channel item
-// ---------------------------------------------------------------------------
-
-#[derive(Debug)]
-enum CcItem {
-    Notif(MuxNotification),
-    Readable,
-}
 
 // ---------------------------------------------------------------------------
 // TmuxCompatSession
@@ -216,10 +206,18 @@ pub fn translate_notification(
             Some(layout_change_notification(tmux_wid, &layout))
         }
 
-        MuxNotification::TabAddedToWindow { tab_id, .. } => {
+        MuxNotification::TabAddedToWindow { tab_id, window_id } => {
             let tmux_wid = session.ctx.id_map.get_or_create_tmux_window_id(tab_id);
-            // Also register any panes in the new tab
+            // Track tab→mux_window relationship for %window-close
             if let Some(mux) = Mux::try_get() {
+                if let Some(win) = mux.get_window(window_id) {
+                    let ws = win.get_workspace().to_string();
+                    session
+                        .ctx
+                        .id_map
+                        .track_tab_in_window(window_id, tab_id, &ws);
+                }
+                // Also register any panes in the new tab
                 if let Some(tab) = mux.get_tab(tab_id) {
                     for pp in tab.iter_panes() {
                         session
@@ -232,11 +230,57 @@ pub fn translate_notification(
             Some(window_add_notification(tmux_wid))
         }
 
-        MuxNotification::WindowRemoved(_window_id) => {
-            // We don't have a direct mux-window→tabs mapping in id_map, so
-            // just emit nothing here.  Layout changes and tab removals
-            // will handle the actual cleanup.
+        MuxNotification::WindowCreated(window_id) => {
+            // Track the workspace for this mux window; emit %sessions-changed
+            // if this is a new workspace we haven't seen before.
+            if let Some(mux) = Mux::try_get() {
+                if let Some(win) = mux.get_window(window_id) {
+                    let ws = win.get_workspace().to_string();
+                    let is_new = session.ctx.id_map.tmux_session_id(&ws).is_none();
+                    session
+                        .ctx
+                        .id_map
+                        .track_mux_window_workspace(window_id, &ws);
+                    if is_new {
+                        // New workspace appeared — register it and notify
+                        session.ctx.id_map.get_or_create_tmux_session_id(&ws);
+                        return Some(sessions_changed_notification());
+                    }
+                }
+            }
             None
+        }
+
+        MuxNotification::WindowRemoved(window_id) => {
+            // Look up which tabs were in this mux window and emit
+            // %window-close for each.
+            let workspace = session
+                .ctx
+                .id_map
+                .mux_window_workspace(window_id)
+                .map(|s| s.to_string());
+            let tab_ids = session.ctx.id_map.remove_mux_window(window_id);
+            let mut out = String::new();
+            for tab_id in &tab_ids {
+                if let Some(tmux_wid) = session.ctx.id_map.tmux_window_id(*tab_id) {
+                    out.push_str(&window_close_notification(tmux_wid));
+                    session.ctx.id_map.remove_window(*tab_id);
+                }
+            }
+            // If the workspace has no more windows, the session is gone
+            if let Some(ws) = &workspace {
+                if let Some(mux) = Mux::try_get() {
+                    let remaining = mux.iter_windows_in_workspace(ws);
+                    if remaining.is_empty() {
+                        out.push_str(&sessions_changed_notification());
+                    }
+                }
+            }
+            if out.is_empty() {
+                None
+            } else {
+                Some(out)
+            }
         }
 
         MuxNotification::PaneFocused(pane_id) => {
@@ -282,19 +326,67 @@ pub fn translate_notification(
             None
         }
 
+        MuxNotification::WorkspaceRenamed {
+            old_workspace,
+            new_workspace,
+        } => {
+            // Re-key the session mapping and emit %session-renamed
+            if let Some(tmux_sid) =
+                session.ctx.id_map.rename_session(&old_workspace, &new_workspace)
+            {
+                Some(session_renamed_notification(tmux_sid, &new_workspace))
+            } else {
+                None
+            }
+        }
+
+        MuxNotification::WindowInvalidated(window_id) => {
+            // Detect active-tab changes → %session-window-changed.
+            // Compare the current active tab against the last known one.
+            if session.ctx.suppress_window_changed > 0 {
+                session.ctx.suppress_window_changed -= 1;
+                return None;
+            }
+            let mux = Mux::try_get()?;
+            let win = mux.get_window(window_id)?;
+            let active_tab = win.get_active()?;
+            let active_tab_id = active_tab.tab_id();
+            let workspace = win.get_workspace().to_string();
+            drop(win);
+
+            let prev = session.ctx.last_active_tab.get(&window_id).copied();
+            session.ctx.last_active_tab.insert(window_id, active_tab_id);
+
+            if prev.is_some() && prev != Some(active_tab_id) {
+                // Active tab actually changed — emit notification
+                let tmux_sid = session
+                    .ctx
+                    .id_map
+                    .get_or_create_tmux_session_id(&workspace);
+                let tmux_wid = session
+                    .ctx
+                    .id_map
+                    .get_or_create_tmux_window_id(active_tab_id);
+                Some(session_window_changed_notification(tmux_sid, tmux_wid))
+            } else {
+                None
+            }
+        }
+
+        MuxNotification::AssignClipboard { .. } => {
+            // Clipboard content changed → %paste-buffer-changed
+            Some(paste_buffer_changed_notification("buffer0"))
+        }
+
         // Notifications with no CC equivalent — silently ignore.
         MuxNotification::PaneOutput(_)
         | MuxNotification::PaneAdded(_)
-        | MuxNotification::WindowCreated(_)
-        | MuxNotification::WindowInvalidated(_)
         | MuxNotification::WindowWorkspaceChanged(_)
         | MuxNotification::ActiveWorkspaceChanged(_)
         | MuxNotification::Alert { .. }
         | MuxNotification::Empty
-        | MuxNotification::AssignClipboard { .. }
         | MuxNotification::SaveToDownloads { .. }
-        | MuxNotification::WindowTitleChanged { .. }
-        | MuxNotification::WorkspaceRenamed { .. } => None,
+        | MuxNotification::WindowTitleChanged { .. } => None,
     }
 }
 
@@ -321,172 +413,175 @@ pub fn extract_lines(buf: &mut String) -> Vec<String> {
 // Main connection loop
 // ---------------------------------------------------------------------------
 
-// Platform-specific trait for raw descriptor access, mirroring
-// `wezterm-mux-server-impl/src/dispatch.rs`.
-#[cfg(unix)]
-pub trait AsRawDesc: std::os::unix::io::AsRawFd + std::os::fd::AsFd {}
-#[cfg(windows)]
-pub trait AsRawDesc: std::os::windows::io::AsRawSocket + std::os::windows::io::AsSocket {}
-
-impl AsRawDesc for wezterm_uds::UnixStream {}
-
-/// Process a single CC protocol connection.
+/// Process a single CC protocol connection synchronously.
 ///
-/// Follows the same async pattern as `wezterm-mux-server-impl/src/dispatch.rs`:
-/// uses `smol::Async<T>`, `smol::channel`, and `smol::future::or` to
-/// multiplex between reading commands and receiving Mux notifications.
-pub async fn process_cc_connection<T>(stream: T) -> anyhow::Result<()>
-where
-    T: 'static + std::io::Read + std::io::Write + std::fmt::Debug + AsRawDesc + async_io::IoSafe,
-{
-    let mut stream = smol::Async::new(stream)?;
+/// Runs on a dedicated thread per connection.  Command dispatch hops to the
+/// main GUI thread via `spawn_into_main_thread` (required for `Mux::get()`).
+/// Generic over any `Read + Write` stream so the listener can pass either a
+/// Unix domain socket (unix) or a TCP stream (Windows).
+/// Monotonic counter for generating unique client names.
+static CLIENT_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-    let workspace = {
-        let mux = Mux::get();
-        mux.active_workspace().to_string()
-    };
-
+fn process_cc_connection_sync(
+    mut stream: impl std::io::Read + std::io::Write,
+    listen_addr: &str,
+) -> anyhow::Result<()> {
+    // Build session and handshake directly on this thread.
+    // Mux::try_get() uses a global Arc and works from any thread.
+    let workspace = Mux::try_get()
+        .map(|mux| mux.active_workspace().to_string())
+        .unwrap_or_else(|| "default".to_string());
     let mut session = TmuxCompatSession::new(workspace);
-
-    // Subscribe to Mux notifications
-    let (item_tx, item_rx) = smol::channel::unbounded::<CcItem>();
-    {
-        let mux = Mux::get();
-        let tx = item_tx.clone();
-        mux.subscribe(move |n| tx.try_send(CcItem::Notif(n)).is_ok());
-    }
-
-    // Send initial handshake
+    let client_num = CLIENT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    session.ctx.client_name = format!("/dev/pts/{}", client_num);
+    session.ctx.socket_path = listen_addr.to_string();
     let handshake = build_initial_handshake(&mut session);
-    stream.write_all(handshake.as_bytes()).await?;
-    stream.flush().await?;
 
-    // Main loop
-    let mut read_buf = [0u8; 4096];
+    std::io::Write::write_all(&mut stream, handshake.as_bytes())?;
+    std::io::Write::flush(&mut stream)?;
+    log::info!("tmux CC: handshake sent ({} bytes)", handshake.len());
+
+    // Manual line-buffered read loop.  We avoid BufReader because we need
+    // to alternate reads and writes on the same stream, and writes through
+    // BufReader::get_mut() don't work reliably on Windows.
+    let mut read_buf = vec![0u8; 4096];
+    let mut accum = String::new();
     loop {
-        let rx_msg = item_rx.recv();
-        let wait_for_read = stream.readable().map(|_| Ok(CcItem::Readable));
-
-        match smol::future::or(rx_msg, wait_for_read).await {
-            Ok(CcItem::Readable) => {
-                let n = match stream.read(&mut read_buf).await {
-                    Ok(0) => {
-                        // EOF — client disconnected
-                        log::trace!("CC client disconnected (EOF)");
-                        return Ok(());
-                    }
-                    Ok(n) => n,
-                    Err(e) => {
-                        log::debug!("CC read error: {}", e);
-                        return Ok(());
-                    }
-                };
-
-                // Append to line buffer
-                let chunk = String::from_utf8_lossy(&read_buf[..n]);
-                session.line_buffer.push_str(&chunk);
-
-                // Process complete lines
-                let lines = extract_lines(&mut session.line_buffer);
-                for line in lines {
-                    let line = line.trim().to_string();
-                    if line.is_empty() {
-                        continue;
-                    }
-
-                    let response = process_single_command(&mut session, &line).await;
-                    stream.write_all(response.as_bytes()).await?;
-                    stream.flush().await?;
-                }
+        // Extract any complete line already in the accumulator.
+        let line = loop {
+            if let Some(pos) = accum.find('\n') {
+                let line = accum[..pos].to_string();
+                accum.drain(..=pos);
+                break line;
             }
-
-            Ok(CcItem::Notif(notif)) => {
-                if let Some(notification_str) = translate_notification(&mut session, notif) {
-                    match stream.write_all(notification_str.as_bytes()).await {
-                        Ok(()) => {
-                            if let Err(e) = stream.flush().await {
-                                log::debug!("CC flush notification error: {}", e);
-                                return Ok(());
-                            }
-                        }
-                        Err(e) => {
-                            log::debug!("CC write notification error: {}", e);
-                            return Ok(());
-                        }
-                    }
-                }
-            }
-
-            Err(_) => {
-                // Channel closed — session is ending
-                log::trace!("CC notification channel closed");
-                let exit = exit_notification(None);
-                let _ = stream.write_all(exit.as_bytes()).await;
-                let _ = stream.flush().await;
+            // Need more data.
+            let n = std::io::Read::read(&mut stream, &mut read_buf)?;
+            if n == 0 {
+                log::trace!("CC client disconnected (EOF)");
                 return Ok(());
             }
+            accum.push_str(&String::from_utf8_lossy(&read_buf[..n]));
+        };
+
+        let trimmed = line.trim().to_string();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        // Dispatch the command on the main thread via spawn_local.
+        let cmd_line = trimmed;
+        let mut ctx =
+            std::mem::replace(&mut session.ctx, HandlerContext::new(String::new()));
+        let (resp_tx, resp_rx) = std::sync::mpsc::sync_channel(1);
+        promise::spawn::spawn_into_main_thread(async move {
+            promise::spawn::spawn(async move {
+                let resp = match parse_command(&cmd_line) {
+                    Ok(cmd) => match dispatch_command(&mut ctx, cmd).await {
+                        Ok(body) => Ok(body),
+                        Err(e) => Err(e),
+                    },
+                    Err(e) => Err(format!("{}", e)),
+                };
+                let _ = resp_tx.send((resp, ctx));
+            })
+            .detach();
+        })
+        .detach();
+
+        let (response, ctx_back) = resp_rx
+            .recv()
+            .map_err(|_| anyhow::anyhow!("failed to receive command response"))?;
+        session.ctx = ctx_back;
+
+        let formatted = match response {
+            Ok(ref body) if body.is_empty() => session.writer.empty_success(),
+            Ok(body) => session.writer.success(&body),
+            Err(e) => session.writer.error(&e),
+        };
+        // Write response directly — no BufReader::get_mut().
+        std::io::Write::write_all(&mut stream, formatted.as_bytes())?;
+        std::io::Write::flush(&mut stream)?;
+
+        // Drain any pending notifications queued by the handler
+        // (e.g. %session-changed after attach-session).
+        for notif in session.ctx.pending_notifications.drain(..) {
+            std::io::Write::write_all(&mut stream, notif.as_bytes())?;
+        }
+        std::io::Write::flush(&mut stream)?;
+
+        // If detach was requested, send %exit and close the connection.
+        if session.ctx.detach_requested {
+            let exit = exit_notification(None);
+            std::io::Write::write_all(&mut stream, exit.as_bytes())?;
+            std::io::Write::flush(&mut stream)?;
+            log::info!("tmux CC: client detached");
+            return Ok(());
         }
     }
 }
 
-/// Parse and dispatch a single command line, returning the formatted response.
-async fn process_single_command(session: &mut TmuxCompatSession, line: &str) -> String {
-    match parse_command(line) {
-        Ok(cmd) => match dispatch_command(&mut session.ctx, cmd).await {
-            Ok(body) => {
-                if body.is_empty() {
-                    session.writer.empty_success()
-                } else {
-                    session.writer.success(&body)
-                }
-            }
-            Err(e) => session.writer.error(&e),
-        },
-        Err(e) => session.writer.error(&format!("{}", e)),
-    }
-}
+
 
 // ---------------------------------------------------------------------------
 // Listener
 // ---------------------------------------------------------------------------
 
-/// Start the tmux CC compatibility listener on the given socket path.
+/// Start the tmux CC compatibility listener.
+///
+/// On Windows, binds a TCP listener on `127.0.0.1:0` (random port) because
+/// `uds_windows` AF_UNIX sockets have unreliable data delivery in the
+/// WezTerm process environment.  On Unix, uses a Unix domain socket at
+/// `socket_path`.
+///
+/// Returns the address string to set in `WEZTERM_TMUX_CC`:
+/// - Unix: the socket file path
+/// - Windows: `tcp:127.0.0.1:PORT`
 ///
 /// Spawns a background thread that accepts connections.  Each connection is
-/// handed off to the main async executor via `spawn_into_main_thread` +
-/// `promise::spawn::spawn` (local, non-Send) since the async domain methods
-/// used by `dispatch_command` return non-Send futures.
-pub fn start_tmux_compat_listener(socket_path: &std::path::Path) -> anyhow::Result<()> {
-    // Remove stale socket if it exists
-    if socket_path.exists() {
-        let _ = std::fs::remove_file(socket_path);
+/// handled synchronously on its own thread.
+pub fn start_tmux_compat_listener(_socket_path: &std::path::Path) -> anyhow::Result<String> {
+    #[cfg(windows)]
+    {
+        start_tmux_compat_listener_tcp()
     }
+    #[cfg(not(windows))]
+    {
+        start_tmux_compat_listener_uds(_socket_path)
+    }
+}
 
-    let listener = wezterm_uds::UnixListener::bind(socket_path)?;
+/// TCP-based listener for Windows.
+#[cfg(windows)]
+fn start_tmux_compat_listener_tcp() -> anyhow::Result<String> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let addr = listener.local_addr()?;
+    let addr_str = format!("tcp:{}", addr);
     log::info!(
         "tmux CC compat listener started on {}",
-        socket_path.display()
+        addr_str
     );
 
+    let addr_for_thread = addr_str.clone();
     let _thread = std::thread::Builder::new()
         .name("tmux-cc-listener".to_string())
         .spawn(move || {
             for stream in listener.incoming() {
                 match stream {
                     Ok(stream) => {
-                        log::trace!("tmux CC: accepted new connection");
-                        // Use spawn_into_main_thread to hop to the main
-                        // thread, then spawn the non-Send connection future
-                        // locally on that thread.
-                        promise::spawn::spawn_into_main_thread(async move {
-                            promise::spawn::spawn(async move {
-                                if let Err(e) = process_cc_connection(stream).await {
+                        // Disable Nagle — without this, writes after the
+                        // initial handshake stall due to delayed-ACK
+                        // interaction on Windows localhost TCP.
+                        let _ = stream.set_nodelay(true);
+                        log::info!("tmux CC: accepted new TCP connection");
+                        let addr = addr_for_thread.clone();
+                        std::thread::Builder::new()
+                            .name("tmux-cc-conn".to_string())
+                            .spawn(move || {
+                                if let Err(e) = process_cc_connection_sync(stream, &addr) {
                                     log::error!("tmux CC connection error: {}", e);
                                 }
                             })
-                            .detach();
-                        })
-                        .detach();
+                            .ok();
                     }
                     Err(e) => {
                         log::error!("tmux CC accept error: {}", e);
@@ -495,8 +590,52 @@ pub fn start_tmux_compat_listener(socket_path: &std::path::Path) -> anyhow::Resu
             }
         })?;
 
-    Ok(())
+    Ok(addr_str)
 }
+
+/// UDS-based listener for Unix.
+#[cfg(not(windows))]
+fn start_tmux_compat_listener_uds(socket_path: &std::path::Path) -> anyhow::Result<String> {
+    if socket_path.exists() {
+        let _ = std::fs::remove_file(socket_path);
+    }
+
+    let listener = wezterm_uds::UnixListener::bind(socket_path)?;
+    let addr_str = socket_path.to_string_lossy().to_string();
+    log::info!(
+        "tmux CC compat listener started on {}",
+        addr_str
+    );
+
+    let addr_for_thread = addr_str.clone();
+    let _thread = std::thread::Builder::new()
+        .name("tmux-cc-listener".to_string())
+        .spawn(move || {
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(stream) => {
+                        log::info!("tmux CC: accepted new connection");
+                        let addr = addr_for_thread.clone();
+                        std::thread::Builder::new()
+                            .name("tmux-cc-conn".to_string())
+                            .spawn(move || {
+                                if let Err(e) = process_cc_connection_sync(stream, &addr) {
+                                    log::error!("tmux CC connection error: {}", e);
+                                }
+                            })
+                            .ok();
+                    }
+                    Err(e) => {
+                        log::error!("tmux CC accept error: {}", e);
+                    }
+                }
+            }
+        })?;
+
+    Ok(addr_str)
+}
+
+
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -682,5 +821,150 @@ mod tests {
         let handshake = build_initial_handshake(&mut session);
         // The session ID allocated should be $0
         assert!(handshake.contains("%session-changed $0 myworkspace"));
+    }
+
+    // --- Phase 6: notification tests ---
+
+    #[test]
+    fn translate_workspace_renamed_emits_session_renamed() {
+        let mut session = TmuxCompatSession::new("old".to_string());
+        // Pre-register the workspace so it has a tmux session ID
+        session.ctx.id_map.get_or_create_tmux_session_id("old");
+        let notif = MuxNotification::WorkspaceRenamed {
+            old_workspace: "old".to_string(),
+            new_workspace: "new".to_string(),
+        };
+        let result = translate_notification(&mut session, notif);
+        assert_eq!(
+            result,
+            Some(session_renamed_notification(0, "new"))
+        );
+        // Verify id_map was re-keyed
+        assert_eq!(session.ctx.id_map.tmux_session_id("old"), None);
+        assert_eq!(session.ctx.id_map.tmux_session_id("new"), Some(0));
+    }
+
+    #[test]
+    fn translate_workspace_renamed_unknown_returns_none() {
+        let mut session = TmuxCompatSession::new("test".to_string());
+        let notif = MuxNotification::WorkspaceRenamed {
+            old_workspace: "unknown".to_string(),
+            new_workspace: "new".to_string(),
+        };
+        assert!(translate_notification(&mut session, notif).is_none());
+    }
+
+    #[test]
+    fn translate_window_removed_emits_window_close() {
+        let mut session = TmuxCompatSession::new("test".to_string());
+        // Set up: register two tabs in mux window 1
+        let tmux_w0 = session.ctx.id_map.get_or_create_tmux_window_id(10);
+        let tmux_w1 = session.ctx.id_map.get_or_create_tmux_window_id(20);
+        session
+            .ctx
+            .id_map
+            .track_tab_in_window(1, 10, "test");
+        session
+            .ctx
+            .id_map
+            .track_tab_in_window(1, 20, "test");
+
+        let result =
+            translate_notification(&mut session, MuxNotification::WindowRemoved(1));
+        let out = result.unwrap();
+        // Should contain %window-close for both tabs
+        assert!(out.contains(&format!("%window-close @{}", tmux_w0)));
+        assert!(out.contains(&format!("%window-close @{}", tmux_w1)));
+        // Tab mappings should be cleaned up
+        assert!(session.ctx.id_map.tmux_window_id(10).is_none());
+        assert!(session.ctx.id_map.tmux_window_id(20).is_none());
+    }
+
+    #[test]
+    fn translate_window_removed_unknown_returns_none() {
+        let mut session = TmuxCompatSession::new("test".to_string());
+        // No tabs tracked for mux window 999
+        assert!(
+            translate_notification(&mut session, MuxNotification::WindowRemoved(999)).is_none()
+        );
+    }
+
+    #[test]
+    fn translate_window_created_without_mux_returns_none() {
+        let mut session = TmuxCompatSession::new("test".to_string());
+        // Without Mux singleton, WindowCreated can't look up workspace
+        assert!(
+            translate_notification(&mut session, MuxNotification::WindowCreated(1)).is_none()
+        );
+    }
+
+    // --- Phase 9: %paste-buffer-changed tests ---
+
+    #[test]
+    fn translate_assign_clipboard_emits_paste_buffer_changed() {
+        let mut session = TmuxCompatSession::new("test".to_string());
+        let notif = MuxNotification::AssignClipboard {
+            pane_id: 0,
+            selection: wezterm_term::ClipboardSelection::Clipboard,
+            clipboard: Some("hello".to_string()),
+        };
+        let result = translate_notification(&mut session, notif);
+        assert_eq!(result, Some("%paste-buffer-changed buffer0\n".to_string()));
+    }
+
+    #[test]
+    fn translate_assign_clipboard_none_content() {
+        let mut session = TmuxCompatSession::new("test".to_string());
+        let notif = MuxNotification::AssignClipboard {
+            pane_id: 0,
+            selection: wezterm_term::ClipboardSelection::PrimarySelection,
+            clipboard: None,
+        };
+        let result = translate_notification(&mut session, notif);
+        assert_eq!(result, Some("%paste-buffer-changed buffer0\n".to_string()));
+    }
+
+    // --- Phase 9: %session-window-changed tests ---
+
+    #[test]
+    fn translate_window_invalidated_without_mux_returns_none() {
+        let mut session = TmuxCompatSession::new("test".to_string());
+        // Without Mux singleton, can't look up window
+        assert!(
+            translate_notification(&mut session, MuxNotification::WindowInvalidated(1)).is_none()
+        );
+    }
+
+    #[test]
+    fn translate_window_invalidated_suppressed() {
+        let mut session = TmuxCompatSession::new("test".to_string());
+        session.ctx.suppress_window_changed = 2;
+        let result =
+            translate_notification(&mut session, MuxNotification::WindowInvalidated(1));
+        assert!(result.is_none());
+        assert_eq!(session.ctx.suppress_window_changed, 1);
+    }
+
+    #[test]
+    fn translate_window_invalidated_suppression_decrements() {
+        let mut session = TmuxCompatSession::new("test".to_string());
+        session.ctx.suppress_window_changed = 1;
+        translate_notification(&mut session, MuxNotification::WindowInvalidated(1));
+        assert_eq!(session.ctx.suppress_window_changed, 0);
+        // Next one should NOT be suppressed (but will return None without Mux)
+        let result =
+            translate_notification(&mut session, MuxNotification::WindowInvalidated(1));
+        // Without Mux, returns None (can't look up window)
+        assert!(result.is_none());
+        assert_eq!(session.ctx.suppress_window_changed, 0);
+    }
+
+    // --- Phase 9: handler context defaults ---
+
+    #[test]
+    fn session_last_active_tab_default_empty() {
+        let session = TmuxCompatSession::new("test".to_string());
+        assert!(session.ctx.last_active_tab.is_empty());
+        assert_eq!(session.ctx.suppress_window_changed, 0);
     }
 }

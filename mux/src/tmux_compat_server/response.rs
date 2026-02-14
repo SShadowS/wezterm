@@ -150,9 +150,24 @@ pub fn session_changed_notification(session_id: u64, name: &str) -> String {
     format!("%session-changed ${} {}\n", session_id, name)
 }
 
+/// `%session-renamed $<session_id> <name>`
+pub fn session_renamed_notification(session_id: u64, name: &str) -> String {
+    format!("%session-renamed ${} {}\n", session_id, name)
+}
+
 /// `%sessions-changed`
 pub fn sessions_changed_notification() -> String {
     "%sessions-changed\n".to_string()
+}
+
+/// `%paste-buffer-changed <buffer_name>`
+pub fn paste_buffer_changed_notification(buffer_name: &str) -> String {
+    format!("%paste-buffer-changed {}\n", buffer_name)
+}
+
+/// `%session-window-changed $<session_id> @<window_id>`
+pub fn session_window_changed_notification(session_id: u64, window_id: u64) -> String {
+    format!("%session-window-changed ${} @{}\n", session_id, window_id)
 }
 
 /// `%exit` or `%exit <reason>`
@@ -437,6 +452,14 @@ mod tests {
     }
 
     #[test]
+    fn session_renamed_notification_basic() {
+        assert_eq!(
+            session_renamed_notification(0, "newname"),
+            "%session-renamed $0 newname\n"
+        );
+    }
+
+    #[test]
     fn sessions_changed_notification_basic() {
         assert_eq!(sessions_changed_notification(), "%sessions-changed\n");
     }
@@ -449,5 +472,37 @@ mod tests {
     #[test]
     fn exit_notification_with_reason() {
         assert_eq!(exit_notification(Some("detached")), "%exit detached\n");
+    }
+
+    #[test]
+    fn paste_buffer_changed_notification_basic() {
+        assert_eq!(
+            paste_buffer_changed_notification("buffer0"),
+            "%paste-buffer-changed buffer0\n"
+        );
+    }
+
+    #[test]
+    fn paste_buffer_changed_notification_numbered() {
+        assert_eq!(
+            paste_buffer_changed_notification("buffer5"),
+            "%paste-buffer-changed buffer5\n"
+        );
+    }
+
+    #[test]
+    fn session_window_changed_notification_basic() {
+        assert_eq!(
+            session_window_changed_notification(0, 2),
+            "%session-window-changed $0 @2\n"
+        );
+    }
+
+    #[test]
+    fn session_window_changed_notification_large_ids() {
+        assert_eq!(
+            session_window_changed_notification(3, 15),
+            "%session-window-changed $3 @15\n"
+        );
     }
 }
