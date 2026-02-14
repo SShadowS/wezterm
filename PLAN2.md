@@ -1,24 +1,24 @@
 # PLAN2.md — Tmux CC Protocol Compatibility Roadmap
 
 **Created**: 2026-02-14
-**Status**: Active development — Phase 10 (format string expansion) complete
+**Status**: Active development — Phase 11 (clipboard/buffer commands) complete
 
 ---
 
 ## Current State
 
-### What Works (Phase 1–5 Complete, Phase 6-10 Complete)
+### What Works (Phase 1–5 Complete, Phase 6-11 Complete)
 
 - **CC protocol server** running on TCP localhost (Windows) / UDS (Unix)
 - **Shim binary** (`tmux-compat-shim`) intercepts `tmux` commands, forwards to CC server
 - **Config option** `enable_tmux_compat = true` in `.wezterm.lua`
 - **Environment variables** `TMUX`, `WEZTERM_TMUX_CC`, `PATH` set in spawned panes
 - **Manual line-buffered I/O** on both server and shim (BufReader breaks Windows sockets)
-- **27 commands** implemented and working (16 Phase 1-5 + 7 Phase 7 + 4 Phase 8)
-- **9 notifications** emitted (+ Phase 6 lifecycle + Phase 9 `%session-window-changed`, `%paste-buffer-changed`)
-- **33 format variables** supported with conditional syntax `#{?cond,true,false}` (20 Phase 1-5 + 13 Phase 10)
+- **32 commands** implemented and working (16 Phase 1-5 + 7 Phase 7 + 4 Phase 8 + 5 Phase 11)
+- **10 notifications** emitted (+ Phase 6 lifecycle + Phase 9 `%session-window-changed`, `%paste-buffer-changed` + Phase 11 `%paste-buffer-deleted`)
+- **36 format variables** supported with conditional syntax `#{?cond,true,false}` (20 Phase 1-5 + 13 Phase 10 + 3 Phase 11)
 
-### Implemented Commands (16)
+### Implemented Commands (32)
 
 | Command | Flags | Notes |
 |---------|-------|-------|
@@ -38,6 +38,22 @@
 | `refresh-client` | `-C`, `-f` | Client resize |
 | `split-window` | `-h`, `-v`, `-t`, `-l` | Split pane |
 | `new-window` | `-t`, `-n` | Create tab |
+| `attach-session` | `-t` | Attach to session (Phase 7) |
+| `detach-client` | — | Detach client (Phase 7) |
+| `kill-session` | `-t` | Kill session (Phase 7) |
+| `kill-window` | `-t` | Kill window (Phase 7) |
+| `list-clients` | `-F` | List clients (Phase 7) |
+| `new-session` | `-s`, `-n`, `-x`, `-y` | Create session (Phase 7) |
+| `switch-client` | `-t` | Switch session (Phase 7) |
+| `rename-session` | `-t`, name | Rename session (Phase 8) |
+| `rename-window` | `-t`, name | Rename window (Phase 8) |
+| `show-options` | `-g`, `-s`, name | Show options (Phase 8) |
+| `show-window-options` | `-g`, name | Show window options (Phase 8) |
+| `show-buffer` | `-b` | Show buffer content (Phase 11) |
+| `set-buffer` | `-b`, `-a`, data | Set/append buffer (Phase 11) |
+| `delete-buffer` | `-b` | Delete buffer (Phase 11) |
+| `list-buffers` | `-F` | List buffers (Phase 11) |
+| `paste-buffer` | `-b`, `-t`, `-d`, `-p` | Paste buffer to pane (Phase 11) |
 
 ### Emitted Notifications (7 active + 2 defined but unused)
 
@@ -53,9 +69,9 @@
 | `%window-close` | **DEFINED BUT NEVER EMITTED (BUG)** | `WindowRemoved` returns `None` |
 | `%exit` | Defined | Not emitted |
 
-### Format Variables (33)
+### Format Variables (36)
 
-`#{pane_id}`, `#{pane_index}`, `#{pane_width}`, `#{pane_height}`, `#{pane_active}`, `#{pane_left}`, `#{pane_top}`, `#{pane_dead}`, `#{window_id}`, `#{window_index}`, `#{window_name}`, `#{window_active}`, `#{window_width}`, `#{window_height}`, `#{session_id}`, `#{session_name}`, `#{cursor_x}`, `#{cursor_y}`, `#{history_limit}`, `#{history_size}`, `#{version}`, `#{pid}`, `#{client_name}`, `#{socket_path}`, `#{pane_title}`, `#{pane_current_command}`, `#{pane_current_path}`, `#{pane_pid}`, `#{pane_mode}`, `#{window_flags}`, `#{window_panes}`, `#{session_windows}`, `#{session_attached}`
+`#{pane_id}`, `#{pane_index}`, `#{pane_width}`, `#{pane_height}`, `#{pane_active}`, `#{pane_left}`, `#{pane_top}`, `#{pane_dead}`, `#{window_id}`, `#{window_index}`, `#{window_name}`, `#{window_active}`, `#{window_width}`, `#{window_height}`, `#{session_id}`, `#{session_name}`, `#{cursor_x}`, `#{cursor_y}`, `#{history_limit}`, `#{history_size}`, `#{version}`, `#{pid}`, `#{client_name}`, `#{socket_path}`, `#{pane_title}`, `#{pane_current_command}`, `#{pane_current_path}`, `#{pane_pid}`, `#{pane_mode}`, `#{window_flags}`, `#{window_panes}`, `#{session_windows}`, `#{session_attached}`, `#{buffer_name}`, `#{buffer_size}`, `#{buffer_sample}`
 
 ---
 
@@ -366,22 +382,91 @@
 
 ## Phase 11: Clipboard / Buffer Commands
 
-**Priority**: LOW — nice-to-have for full compatibility
-**Status**: [ ] Not started
+**Priority**: MEDIUM — `show-buffer` is required for iTerm2 clipboard sync
+**Status**: [x] Complete
 
-### Commands
+### Verification Notes (from tmux + iTerm2 source analysis)
 
-- [ ] `list-buffers` — list clipboard buffers
-- [ ] `show-buffer` / `show-buffer -b <name>` — show buffer content
-- [ ] `set-buffer` — set buffer content
-- [ ] `paste-buffer` — paste to pane
-- [ ] `delete-buffer` — remove buffer
+**tmux buffer model** (`paste.c`, `paste.h`):
+- Named paste buffer stack: up to 50 auto-named (`buffer0`..`buffer49`) + unlimited user-named
+- Fields: `name`, `data` (raw bytes, not null-terminated), `size`, `created`, `automatic`, `order`
+- Two red-black trees: by name and by insertion order (newest first)
+- `buffer-limit` option (default 50) applies only to automatic buffers
+- Notifications: `%paste-buffer-changed <name>` and `%paste-buffer-deleted <name>` (from `control-notify.c`)
 
-### Notes
+**iTerm2 usage** (`TmuxController.m`, `TmuxGateway.m`):
+- **Only `show-buffer` is used** — fetches buffer contents for clipboard sync
+- Flow: `%paste-buffer-changed buffer0` → validate name matches `buffer[0-9]+` → `show-buffer -b buffer0` → set macOS pasteboard
+- Clipboard sync is **opt-in** (disabled by default, user prompted on first notification)
+- `list-buffers` is in iTerm2's `forbiddenCommands` array (blocked from user keybindings, not used internally)
+- `set-buffer`, `paste-buffer`, `delete-buffer`: **not used at all**
 
-- WezTerm uses system clipboard; may need a buffer abstraction layer
-- iTerm2 uses these for clipboard integration between tmux and the GUI
-- **Difficulty**: Hard (needs clipboard integration design)
+**WezTerm current state**:
+- `%paste-buffer-changed buffer0` already emitted on `AssignClipboard`
+- `pane.send_paste()` available for paste-buffer (handles bracketed paste automatically)
+- `pane.writer()` available for raw PTY input
+- No in-process buffer store — only system clipboard
+
+**Architecture**: In-process `PasteBufferStore` in `HandlerContext`, storing named buffers with auto-naming. `buffer0` synced from `AssignClipboard` notifications. No system clipboard write-back needed (WezTerm GUI handles that separately).
+
+### 11.1 — Paste buffer store
+
+- [x] Add `PasteBufferStore` struct to new `paste_buffer.rs` module
+- [x] Fields per buffer: `name: String`, `data: String`, `automatic: bool`, `order: u64`
+- [x] Methods: `set()`, `get()`, `delete()`, `list()`, `get_most_recent()`, `rename()`
+- [x] Auto-naming: `buffer0`, `buffer1`, ... with monotonic counter
+- [x] Buffer limit: hardcode 50 for automatic buffers; evict oldest when exceeded
+- [x] Add `paste_buffers: PasteBufferStore` field to `HandlerContext`
+- [x] On `AssignClipboard` notification: store content as `buffer0` (or next auto-name)
+- **Files**: `paste_buffer.rs` (new), `handlers.rs`, `server.rs`, `mod.rs`
+- **Difficulty**: Medium
+
+### 11.2 — `show-buffer` command (HIGH — iTerm2 clipboard sync)
+
+- [x] Add `ShowBuffer { buffer_name: Option<String> }` to `TmuxCliCommand`
+- [x] Parse `-b <buffer-name>` flag (alias: `showb`)
+- [x] Handler: resolve buffer name → return buffer content as raw text
+- [x] Default (no `-b`): return most recent automatic buffer
+- [x] Error: `"no buffers"` if store empty, `"unknown buffer: <name>"` if not found
+- **Files**: `command_parser.rs`, `handlers.rs`
+- **Difficulty**: Easy
+
+### 11.3 — `set-buffer` command (LOW — not used by iTerm2)
+
+- [x] Add `SetBuffer { buffer_name: Option<String>, data: Option<String>, append: bool }` to `TmuxCliCommand`
+- [x] Parse `-b <name>`, `-a` (append), positional data (alias: `setb`)
+- [x] Handler: create or update buffer in store; emit `%paste-buffer-changed`
+- [x] Auto-name if no `-b` specified
+- **Files**: `command_parser.rs`, `handlers.rs`
+- **Difficulty**: Easy
+
+### 11.4 — `delete-buffer` command (LOW — not used by iTerm2)
+
+- [x] Add `DeleteBuffer { buffer_name: Option<String> }` to `TmuxCliCommand`
+- [x] Parse `-b <buffer-name>` flag (alias: `deleteb`)
+- [x] Handler: remove buffer from store; emit `%paste-buffer-deleted`
+- [x] Default: delete most recent automatic buffer
+- **Files**: `command_parser.rs`, `handlers.rs`
+- **Difficulty**: Easy
+
+### 11.5 — `list-buffers` command (LOW — not used by iTerm2)
+
+- [x] Add `ListBuffers { format: Option<String> }` to `TmuxCliCommand`
+- [x] Parse `-F <format>` flag (alias: `lsb`)
+- [x] Handler: iterate store, expand format per buffer
+- [x] Default format: `#{buffer_name}: #{buffer_size} bytes: "#{buffer_sample}"`
+- [x] Add `buffer_name`, `buffer_size`, `buffer_sample` to `FormatContext`
+- **Files**: `command_parser.rs`, `handlers.rs`, `format.rs`
+- **Difficulty**: Easy
+
+### 11.6 — `paste-buffer` command (LOW — not used by iTerm2)
+
+- [x] Add `PasteBuffer { buffer_name: Option<String>, target: Option<String>, delete: bool, bracketed: bool }` to `TmuxCliCommand`
+- [x] Parse `-b <name>`, `-t <target>`, `-d` (delete after), `-p` (bracketed paste) (alias: `pasteb`)
+- [x] Handler: get buffer content → `pane.send_paste()` (handles bracketed paste); `-d` → delete buffer
+- [x] Note: tmux default line separator is `\r`; `pane.send_paste()` already handles line ending conversion
+- **Files**: `command_parser.rs`, `handlers.rs`
+- **Difficulty**: Easy
 
 ---
 

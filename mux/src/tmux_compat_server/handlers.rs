@@ -19,6 +19,7 @@ use crate::Mux;
 use super::command_parser::TmuxCliCommand;
 use super::format::{expand_format, FormatContext};
 use super::id_map::IdMap;
+use super::paste_buffer::{buffer_sample, PasteBufferStore};
 use super::response::session_changed_notification;
 use super::target::{parse_target, PaneRef, SessionRef, TmuxTarget, WindowRef};
 
@@ -51,6 +52,8 @@ pub struct HandlerContext {
     pub client_name: String,
     /// Listen address for `#{socket_path}` format variable.
     pub socket_path: String,
+    /// In-process paste buffer store for clipboard/buffer commands.
+    pub paste_buffers: PasteBufferStore,
 }
 
 impl HandlerContext {
@@ -67,6 +70,7 @@ impl HandlerContext {
             suppress_window_changed: 0,
             client_name: String::new(),
             socket_path: String::new(),
+            paste_buffers: PasteBufferStore::new(),
         }
     }
 }
@@ -411,6 +415,9 @@ pub fn build_format_context(
         client_name: ctx.client_name.clone(),
         socket_path: ctx.socket_path.clone(),
         server_pid: std::process::id() as u64,
+        buffer_name: String::new(),
+        buffer_size: 0,
+        buffer_sample: String::new(),
     }
 }
 
@@ -508,6 +515,27 @@ pub async fn dispatch_command(
         TmuxCliCommand::ListClients { format, target: _ } => {
             handle_list_clients(ctx, format.as_deref())
         }
+        // Phase 11: clipboard / buffer commands
+        TmuxCliCommand::ShowBuffer { buffer_name } => {
+            handle_show_buffer(ctx, buffer_name.as_deref())
+        }
+        TmuxCliCommand::SetBuffer {
+            buffer_name,
+            data,
+            append,
+        } => handle_set_buffer(ctx, buffer_name.as_deref(), data.as_deref(), append),
+        TmuxCliCommand::DeleteBuffer { buffer_name } => {
+            handle_delete_buffer(ctx, buffer_name.as_deref())
+        }
+        TmuxCliCommand::ListBuffers { format } => {
+            handle_list_buffers(ctx, format.as_deref())
+        }
+        TmuxCliCommand::PasteBuffer {
+            buffer_name,
+            target,
+            delete_after,
+            bracketed: _,
+        } => handle_paste_buffer(ctx, buffer_name.as_deref(), &target, delete_after),
     }
 }
 
@@ -520,12 +548,14 @@ pub fn handle_list_commands() -> String {
     let mut commands = vec![
         "attach-session",
         "capture-pane",
+        "delete-buffer",
         "detach-client",
         "display-message",
         "has-session",
         "kill-pane",
         "kill-session",
         "kill-window",
+        "list-buffers",
         "list-clients",
         "list-commands",
         "list-panes",
@@ -533,6 +563,7 @@ pub fn handle_list_commands() -> String {
         "list-windows",
         "new-session",
         "new-window",
+        "paste-buffer",
         "refresh-client",
         "rename-session",
         "rename-window",
@@ -541,6 +572,8 @@ pub fn handle_list_commands() -> String {
         "select-pane",
         "select-window",
         "send-keys",
+        "set-buffer",
+        "show-buffer",
         "show-options",
         "show-window-options",
         "split-window",
@@ -1570,6 +1603,170 @@ pub fn handle_list_clients(ctx: &mut HandlerContext, format: Option<&str>) -> Re
 }
 
 // ---------------------------------------------------------------------------
+// Phase 11: clipboard / buffer command handlers
+// ---------------------------------------------------------------------------
+
+/// `show-buffer [-b buffer-name]` — return buffer content as raw text.
+fn handle_show_buffer(
+    ctx: &mut HandlerContext,
+    buffer_name: Option<&str>,
+) -> Result<String, String> {
+    let buf = match buffer_name {
+        Some(name) => ctx
+            .paste_buffers
+            .get(name)
+            .ok_or_else(|| format!("unknown buffer: {}", name))?,
+        None => ctx
+            .paste_buffers
+            .most_recent()
+            .ok_or_else(|| "no buffers".to_string())?,
+    };
+    Ok(buf.data.clone())
+}
+
+/// `set-buffer [-a] [-b buffer-name] [data]` — create/update a buffer.
+fn handle_set_buffer(
+    ctx: &mut HandlerContext,
+    buffer_name: Option<&str>,
+    data: Option<&str>,
+    append: bool,
+) -> Result<String, String> {
+    if append {
+        let name = buffer_name.ok_or_else(|| "set-buffer -a requires -b".to_string())?;
+        let content = data.unwrap_or("");
+        ctx.paste_buffers
+            .append(name, content)
+            .map_err(|e| e.to_string())?;
+        ctx.pending_notifications.push(
+            super::response::paste_buffer_changed_notification(name),
+        );
+        return Ok(String::new());
+    }
+
+    let content = data
+        .ok_or_else(|| "no data specified".to_string())?
+        .to_string();
+    let name = ctx.paste_buffers.set(buffer_name, content);
+    ctx.pending_notifications
+        .push(super::response::paste_buffer_changed_notification(&name));
+    Ok(String::new())
+}
+
+/// `delete-buffer [-b buffer-name]` — remove a buffer.
+fn handle_delete_buffer(
+    ctx: &mut HandlerContext,
+    buffer_name: Option<&str>,
+) -> Result<String, String> {
+    match buffer_name {
+        Some(name) => {
+            if ctx.paste_buffers.delete(name) {
+                ctx.pending_notifications.push(
+                    super::response::paste_buffer_deleted_notification(name),
+                );
+                Ok(String::new())
+            } else {
+                Err(format!("unknown buffer: {}", name))
+            }
+        }
+        None => match ctx.paste_buffers.delete_most_recent() {
+            Some(name) => {
+                ctx.pending_notifications.push(
+                    super::response::paste_buffer_deleted_notification(&name),
+                );
+                Ok(String::new())
+            }
+            None => Err("no buffers".to_string()),
+        },
+    }
+}
+
+/// `list-buffers [-F format]` — list all buffers with format expansion.
+fn handle_list_buffers(
+    ctx: &mut HandlerContext,
+    format: Option<&str>,
+) -> Result<String, String> {
+    let default_fmt = "#{buffer_name}: #{buffer_size} bytes: \"#{buffer_sample}\"";
+    let fmt = format.unwrap_or(default_fmt);
+
+    let bufs: Vec<_> = ctx
+        .paste_buffers
+        .list()
+        .iter()
+        .map(|b| (b.name.clone(), b.data.clone()))
+        .collect();
+
+    let mut lines = Vec::new();
+    for (name, data) in &bufs {
+        // Build a minimal FormatContext with buffer fields populated.
+        let fctx = FormatContext {
+            buffer_name: name.clone(),
+            buffer_size: data.len() as u64,
+            buffer_sample: buffer_sample(data),
+            session_name: ctx.workspace.clone(),
+            session_attached: 1,
+            client_name: ctx.client_name.clone(),
+            socket_path: ctx.socket_path.clone(),
+            server_pid: std::process::id() as u64,
+            ..FormatContext::default()
+        };
+        lines.push(expand_format(fmt, &fctx));
+    }
+    Ok(lines.join("\n"))
+}
+
+/// `paste-buffer [-d] [-p] [-b buffer-name] [-t target-pane]` — send buffer
+/// content to a pane's input.
+fn handle_paste_buffer(
+    ctx: &mut HandlerContext,
+    buffer_name: Option<&str>,
+    target: &Option<String>,
+    delete_after: bool,
+) -> Result<String, String> {
+    let buf = match buffer_name {
+        Some(name) => ctx
+            .paste_buffers
+            .get(name)
+            .ok_or_else(|| format!("unknown buffer: {}", name))?,
+        None => ctx
+            .paste_buffers
+            .most_recent()
+            .ok_or_else(|| "no buffers".to_string())?,
+    };
+    let data = buf.data.clone();
+    let buf_name = buf.name.clone();
+
+    // Resolve target pane.
+    let mux = Mux::try_get().ok_or_else(|| "mux not available".to_string())?;
+    let pane_id = if let Some(ref t) = target {
+        let resolved = ctx.resolve_target(&Some(t.clone()))?;
+        resolved
+            .pane_id
+            .ok_or_else(|| format!("can't find pane: {}", t))?
+    } else {
+        ctx.active_pane_id
+            .and_then(|tmux_id| ctx.id_map.wezterm_pane_id(tmux_id))
+            .ok_or_else(|| "no active pane".to_string())?
+    };
+
+    let pane = mux
+        .get_pane(pane_id)
+        .ok_or_else(|| "pane not found".to_string())?;
+
+    // send_paste handles bracketed paste based on pane's terminal mode.
+    pane.send_paste(&data)
+        .map_err(|e| format!("paste failed: {}", e))?;
+
+    if delete_after {
+        ctx.paste_buffers.delete(&buf_name);
+        ctx.pending_notifications.push(
+            super::response::paste_buffer_deleted_notification(&buf_name),
+        );
+    }
+
+    Ok(String::new())
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -1746,15 +1943,17 @@ mod tests {
     fn list_commands_contains_all() {
         let output = handle_list_commands();
         let commands: Vec<&str> = output.lines().collect();
-        assert_eq!(commands.len(), 27);
+        assert_eq!(commands.len(), 32);
         assert!(commands.contains(&"attach-session"));
         assert!(commands.contains(&"capture-pane"));
+        assert!(commands.contains(&"delete-buffer"));
         assert!(commands.contains(&"detach-client"));
         assert!(commands.contains(&"display-message"));
         assert!(commands.contains(&"has-session"));
         assert!(commands.contains(&"kill-pane"));
         assert!(commands.contains(&"kill-session"));
         assert!(commands.contains(&"kill-window"));
+        assert!(commands.contains(&"list-buffers"));
         assert!(commands.contains(&"list-clients"));
         assert!(commands.contains(&"list-commands"));
         assert!(commands.contains(&"list-panes"));
@@ -1762,6 +1961,7 @@ mod tests {
         assert!(commands.contains(&"list-windows"));
         assert!(commands.contains(&"new-session"));
         assert!(commands.contains(&"new-window"));
+        assert!(commands.contains(&"paste-buffer"));
         assert!(commands.contains(&"refresh-client"));
         assert!(commands.contains(&"rename-session"));
         assert!(commands.contains(&"rename-window"));
@@ -1770,6 +1970,8 @@ mod tests {
         assert!(commands.contains(&"select-pane"));
         assert!(commands.contains(&"select-window"));
         assert!(commands.contains(&"send-keys"));
+        assert!(commands.contains(&"set-buffer"));
+        assert!(commands.contains(&"show-buffer"));
         assert!(commands.contains(&"show-options"));
         assert!(commands.contains(&"show-window-options"));
         assert!(commands.contains(&"split-window"));

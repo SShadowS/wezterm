@@ -117,6 +117,27 @@ pub enum TmuxCliCommand {
         format: Option<String>,
         target: Option<String>,
     },
+    // Phase 11: clipboard / buffer commands
+    ShowBuffer {
+        buffer_name: Option<String>,
+    },
+    SetBuffer {
+        buffer_name: Option<String>,
+        data: Option<String>,
+        append: bool,
+    },
+    DeleteBuffer {
+        buffer_name: Option<String>,
+    },
+    ListBuffers {
+        format: Option<String>,
+    },
+    PasteBuffer {
+        buffer_name: Option<String>,
+        target: Option<String>,
+        delete_after: bool,
+        bracketed: bool,
+    },
 }
 
 /// Parse a tmux command line into a structured [`TmuxCliCommand`].
@@ -167,6 +188,11 @@ pub fn parse_command(line: &str) -> Result<TmuxCliCommand> {
         "detach-client" | "detach" => parse_detach_client(args),
         "switch-client" | "switchc" => parse_switch_client(args),
         "list-clients" | "lsc" => parse_list_clients(args),
+        "show-buffer" | "showb" => parse_show_buffer(args),
+        "set-buffer" | "setb" => parse_set_buffer(args),
+        "delete-buffer" | "deleteb" => parse_delete_buffer(args),
+        "list-buffers" | "lsb" => parse_list_buffers(args),
+        "paste-buffer" | "pasteb" => parse_paste_buffer(args),
         other => bail!("unknown tmux command: {other:?}"),
     }
 }
@@ -738,6 +764,132 @@ fn parse_list_clients(args: &[String]) -> Result<TmuxCliCommand> {
     }
 
     Ok(TmuxCliCommand::ListClients { format, target })
+}
+
+// ---------------------------------------------------------------------------
+// Phase 11: clipboard / buffer command parsers
+// ---------------------------------------------------------------------------
+
+fn parse_show_buffer(args: &[String]) -> Result<TmuxCliCommand> {
+    let mut buffer_name = None;
+    let strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let mut iter = strs.iter().copied();
+    while let Some(arg) = iter.next() {
+        match arg {
+            "-b" => buffer_name = Some(take_flag_value("-b", &mut iter)?),
+            other => bail!("show-buffer: unexpected argument: {other:?}"),
+        }
+    }
+    Ok(TmuxCliCommand::ShowBuffer { buffer_name })
+}
+
+fn parse_set_buffer(args: &[String]) -> Result<TmuxCliCommand> {
+    let mut buffer_name = None;
+    let mut append = false;
+    let mut data = None;
+    let strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let mut iter = strs.iter().copied();
+    while let Some(arg) = iter.next() {
+        match arg {
+            "-b" => buffer_name = Some(take_flag_value("-b", &mut iter)?),
+            "-a" => append = true,
+            "-w" | "-n" | "-t" => {
+                // Accept but ignore: -w (clipboard sync), -n (rename), -t (target client)
+                let _ = take_flag_value(arg, &mut iter).ok();
+            }
+            // Positional: the data to set. Take the rest as a single string if `--` was used,
+            // or treat this as the data argument.
+            "--" => {
+                let rest: Vec<&str> = iter.collect();
+                if !rest.is_empty() {
+                    data = Some(rest.join(" "));
+                }
+                break;
+            }
+            _ => {
+                // First non-flag argument is the data.
+                data = Some(arg.to_string());
+                // Collect any remaining args as part of data (shouldn't happen
+                // with shell_words splitting, but be safe).
+                let rest: Vec<&str> = iter.collect();
+                if !rest.is_empty() {
+                    let mut d = data.unwrap();
+                    for r in rest {
+                        d.push(' ');
+                        d.push_str(r);
+                    }
+                    data = Some(d);
+                }
+                break;
+            }
+        }
+    }
+    Ok(TmuxCliCommand::SetBuffer {
+        buffer_name,
+        data,
+        append,
+    })
+}
+
+fn parse_delete_buffer(args: &[String]) -> Result<TmuxCliCommand> {
+    let mut buffer_name = None;
+    let strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let mut iter = strs.iter().copied();
+    while let Some(arg) = iter.next() {
+        match arg {
+            "-b" => buffer_name = Some(take_flag_value("-b", &mut iter)?),
+            other => bail!("delete-buffer: unexpected argument: {other:?}"),
+        }
+    }
+    Ok(TmuxCliCommand::DeleteBuffer { buffer_name })
+}
+
+fn parse_list_buffers(args: &[String]) -> Result<TmuxCliCommand> {
+    let mut format = None;
+    let strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let mut iter = strs.iter().copied();
+    while let Some(arg) = iter.next() {
+        match arg {
+            "-F" => format = Some(take_flag_value("-F", &mut iter)?),
+            "-f" | "-O" => {
+                // Accept but ignore: -f (filter), -O (sort order)
+                let _ = take_flag_value(arg, &mut iter).ok();
+            }
+            "-r" => {} // Accept but ignore reverse flag
+            other => bail!("list-buffers: unexpected argument: {other:?}"),
+        }
+    }
+    Ok(TmuxCliCommand::ListBuffers { format })
+}
+
+fn parse_paste_buffer(args: &[String]) -> Result<TmuxCliCommand> {
+    let mut buffer_name = None;
+    let mut target = None;
+    let mut delete_after = false;
+    let mut bracketed = false;
+    let strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let mut iter = strs.iter().copied();
+    while let Some(arg) = iter.next() {
+        match arg {
+            "-b" => buffer_name = Some(take_flag_value("-b", &mut iter)?),
+            "-t" => target = Some(take_flag_value("-t", &mut iter)?),
+            "-d" => delete_after = true,
+            "-p" => bracketed = true,
+            "-r" | "-s" => {
+                // Accept but ignore: -r (LF separator), -s (custom separator)
+                if arg == "-s" {
+                    let _ = take_flag_value("-s", &mut iter).ok();
+                }
+            }
+            other => bail!("paste-buffer: unexpected argument: {other:?}"),
+        }
+    }
+    Ok(TmuxCliCommand::PasteBuffer {
+        buffer_name,
+        target,
+        delete_after,
+        bracketed,
+    })
 }
 
 #[cfg(test)]

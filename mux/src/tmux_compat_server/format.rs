@@ -41,6 +41,10 @@ pub struct FormatContext {
     pub client_name: String,
     pub socket_path: String,
     pub server_pid: u64,
+    // Phase 11: buffer format variables (used by list-buffers)
+    pub buffer_name: String,
+    pub buffer_size: u64,
+    pub buffer_sample: String,
 }
 
 impl FormatContext {
@@ -288,6 +292,16 @@ fn resolve_variable(name: &str, ctx: &FormatContext, output: &mut String) {
         "pid" => {
             let _ = write!(output, "{}", ctx.server_pid);
         }
+        // Phase 11: buffer format variables
+        "buffer_name" => {
+            output.push_str(&ctx.buffer_name);
+        }
+        "buffer_size" => {
+            let _ = write!(output, "{}", ctx.buffer_size);
+        }
+        "buffer_sample" => {
+            output.push_str(&ctx.buffer_sample);
+        }
         _ => {
             // Unknown variable — expand to empty string.
         }
@@ -333,6 +347,9 @@ mod tests {
             client_name: "/dev/pts/0".to_string(),
             socket_path: "/tmp/tmux-1000/default".to_string(),
             server_pid: 9999,
+            buffer_name: String::new(),
+            buffer_size: 0,
+            buffer_sample: String::new(),
         }
     }
 

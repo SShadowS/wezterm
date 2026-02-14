@@ -373,8 +373,11 @@ pub fn translate_notification(
             }
         }
 
-        MuxNotification::AssignClipboard { .. } => {
-            // Clipboard content changed → %paste-buffer-changed
+        MuxNotification::AssignClipboard { clipboard, .. } => {
+            // Clipboard content changed → store in paste buffer and notify
+            if let Some(content) = clipboard {
+                session.ctx.paste_buffers.set(None, content);
+            }
             Some(paste_buffer_changed_notification("buffer0"))
         }
 

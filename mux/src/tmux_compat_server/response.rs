@@ -165,6 +165,11 @@ pub fn paste_buffer_changed_notification(buffer_name: &str) -> String {
     format!("%paste-buffer-changed {}\n", buffer_name)
 }
 
+/// `%paste-buffer-deleted <buffer_name>`
+pub fn paste_buffer_deleted_notification(buffer_name: &str) -> String {
+    format!("%paste-buffer-deleted {}\n", buffer_name)
+}
+
 /// `%session-window-changed $<session_id> @<window_id>`
 pub fn session_window_changed_notification(session_id: u64, window_id: u64) -> String {
     format!("%session-window-changed ${} @{}\n", session_id, window_id)

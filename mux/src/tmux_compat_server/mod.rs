@@ -9,6 +9,7 @@ pub mod format;
 pub mod handlers;
 pub mod id_map;
 pub mod layout;
+pub mod paste_buffer;
 pub mod response;
 pub mod server;
 pub mod target;
