@@ -10,9 +10,8 @@ use config::keyassignment::SpawnTabDomain;
 use wezterm_term::TerminalSize;
 
 use crate::domain::SplitSource;
-use crate::pane::{Pane, PaneId};
+use crate::pane::{CachePolicy, Pane, PaneId};
 use crate::tab::{SplitDirection, SplitRequest, SplitSize, Tab};
-use crate::pane::CachePolicy;
 use crate::window::WindowId;
 use crate::Mux;
 
@@ -527,9 +526,11 @@ pub async fn dispatch_command(
             target,
         } => handle_list_windows(ctx, all, format.as_deref(), &target),
         TmuxCliCommand::ListSessions { format } => handle_list_sessions(ctx, format.as_deref()),
-        TmuxCliCommand::DisplayMessage { print: _, format } => {
-            handle_display_message(ctx, format.as_deref())
-        }
+        TmuxCliCommand::DisplayMessage {
+            print: _,
+            format,
+            target,
+        } => handle_display_message(ctx, format.as_deref(), &target),
         TmuxCliCommand::CapturePane {
             print: _,
             target,
@@ -544,7 +545,11 @@ pub async fn dispatch_command(
             hex,
             keys,
         } => handle_send_keys(ctx, &target, literal, hex, &keys),
-        TmuxCliCommand::SelectPane { target } => handle_select_pane(ctx, &target),
+        TmuxCliCommand::SelectPane {
+            target,
+            style: _,
+            title,
+        } => handle_select_pane(ctx, &target, title.as_deref()),
         TmuxCliCommand::SelectWindow { target } => handle_select_window(ctx, &target),
         TmuxCliCommand::KillPane { target } => handle_kill_pane(ctx, &target),
         TmuxCliCommand::ResizePane {
@@ -563,26 +568,53 @@ pub async fn dispatch_command(
             flags,
             adjust_pane,
             subscription,
-        } => handle_refresh_client(ctx, size.as_deref(), flags.as_deref(), adjust_pane.as_deref(), subscription.as_deref()),
+        } => handle_refresh_client(
+            ctx,
+            size.as_deref(),
+            flags.as_deref(),
+            adjust_pane.as_deref(),
+            subscription.as_deref(),
+        ),
         TmuxCliCommand::SplitWindow {
             horizontal,
             vertical: _,
             target,
             size,
-        } => handle_split_window(ctx, horizontal, &target, size.as_deref()).await,
-        TmuxCliCommand::NewWindow { target, name } => {
-            handle_new_window(ctx, &target, name.as_deref()).await
+            print_and_format,
+        } => {
+            handle_split_window(
+                ctx,
+                horizontal,
+                &target,
+                size.as_deref(),
+                print_and_format.as_deref(),
+            )
+            .await
         }
+        TmuxCliCommand::NewWindow {
+            target,
+            name,
+            print_and_format,
+        } => handle_new_window(ctx, &target, name.as_deref(), print_and_format.as_deref()).await,
         TmuxCliCommand::KillWindow { target } => handle_kill_window(ctx, &target),
         TmuxCliCommand::KillSession { target } => handle_kill_session(ctx, &target),
-        TmuxCliCommand::RenameWindow { target, name } => {
-            handle_rename_window(ctx, &target, &name)
-        }
+        TmuxCliCommand::RenameWindow { target, name } => handle_rename_window(ctx, &target, &name),
         TmuxCliCommand::RenameSession { target, name } => {
             handle_rename_session(ctx, &target, &name)
         }
-        TmuxCliCommand::NewSession { name } => {
-            handle_new_session(ctx, name.as_deref()).await
+        TmuxCliCommand::NewSession {
+            name,
+            window_name,
+            detached: _,
+            print_and_format,
+        } => {
+            handle_new_session(
+                ctx,
+                name.as_deref(),
+                window_name.as_deref(),
+                print_and_format.as_deref(),
+            )
+            .await
         }
         TmuxCliCommand::ShowOptions {
             global,
@@ -612,9 +644,7 @@ pub async fn dispatch_command(
         TmuxCliCommand::DeleteBuffer { buffer_name } => {
             handle_delete_buffer(ctx, buffer_name.as_deref())
         }
-        TmuxCliCommand::ListBuffers { format } => {
-            handle_list_buffers(ctx, format.as_deref())
-        }
+        TmuxCliCommand::ListBuffers { format } => handle_list_buffers(ctx, format.as_deref()),
         TmuxCliCommand::PasteBuffer {
             buffer_name,
             target,
@@ -627,12 +657,23 @@ pub async fn dispatch_command(
             horizontal,
             before,
         } => handle_move_pane(ctx, &src, &dst, horizontal, before).await,
-        TmuxCliCommand::MoveWindow { src, dst } => {
-            handle_move_window(ctx, &src, &dst)
-        }
-        TmuxCliCommand::CopyMode { quit, target: _ } => {
-            handle_copy_mode(quit)
-        }
+        TmuxCliCommand::MoveWindow { src, dst } => handle_move_window(ctx, &src, &dst),
+        TmuxCliCommand::CopyMode { quit, target: _ } => handle_copy_mode(quit),
+        // Phase 13: Claude Code agent teams compatibility
+        TmuxCliCommand::SetOption {
+            target: _,
+            option_name,
+            value,
+        } => handle_set_option(option_name.as_deref(), value.as_deref()),
+        TmuxCliCommand::SelectLayout {
+            target: _,
+            layout_name: _,
+        } => Ok(String::new()),
+        TmuxCliCommand::BreakPane {
+            detach,
+            source,
+            target,
+        } => handle_break_pane(ctx, detach, &source, &target).await,
     }
 }
 
@@ -644,6 +685,7 @@ pub async fn dispatch_command(
 pub fn handle_list_commands() -> String {
     let mut commands = vec![
         "attach-session",
+        "break-pane",
         "capture-pane",
         "copy-mode",
         "delete-buffer",
@@ -670,10 +712,12 @@ pub fn handle_list_commands() -> String {
         "rename-window",
         "resize-pane",
         "resize-window",
+        "select-layout",
         "select-pane",
         "select-window",
         "send-keys",
         "set-buffer",
+        "set-option",
         "show-buffer",
         "show-options",
         "show-window-options",
@@ -918,14 +962,15 @@ pub fn handle_list_sessions(
 pub fn handle_display_message(
     ctx: &mut HandlerContext,
     format: Option<&str>,
+    target: &Option<String>,
 ) -> Result<String, String> {
     let default_format = "#{session_name}:#{window_index}.#{pane_index}";
     let fmt = format.unwrap_or(default_format);
 
-    // Build context from the current active pane
+    // Build context from the target pane (or active pane if no target)
     let mux = Mux::try_get().ok_or_else(|| "mux not available".to_string())?;
 
-    let resolved = ctx.resolve_target(&None)?;
+    let resolved = ctx.resolve_target(target)?;
     if let (Some(pane_id), Some(tab_id), Some(wid)) =
         (resolved.pane_id, resolved.tab_id, resolved.window_id)
     {
@@ -1036,6 +1081,7 @@ pub fn handle_send_keys(
 pub fn handle_select_pane(
     ctx: &mut HandlerContext,
     target: &Option<String>,
+    title: Option<&str>,
 ) -> Result<String, String> {
     let mux = Mux::try_get().ok_or_else(|| "mux not available".to_string())?;
 
@@ -1043,6 +1089,15 @@ pub fn handle_select_pane(
     let pane_id = resolved
         .pane_id
         .ok_or_else(|| "no pane resolved".to_string())?;
+
+    // If -T was specified, set pane title (best effort — WezTerm doesn't have per-pane titles,
+    // so we set the containing tab's title instead)
+    if let Some(new_title) = title {
+        let workspace = ctx.workspace.clone();
+        if let Some((tab, _wid)) = find_tab_and_window_for_pane(&mux, pane_id, &workspace) {
+            tab.set_title(new_title);
+        }
+    }
 
     mux.focus_pane_and_containing_tab(pane_id)
         .map_err(|e| format!("select-pane failed: {}", e))?;
@@ -1288,10 +1343,7 @@ pub fn handle_refresh_client(
 /// Parse `-A %<pane>:<action>` and apply the action.
 ///
 /// Actions: `on`, `off`, `continue`, `pause`
-fn parse_and_apply_pane_adjust(
-    ctx: &mut HandlerContext,
-    spec: &str,
-) -> Result<(), String> {
+fn parse_and_apply_pane_adjust(ctx: &mut HandlerContext, spec: &str) -> Result<(), String> {
     // Format: "%<pane_id>:<action>" or just "%<pane_id>" (defaults to "on")
     let (pane_part, action) = match spec.find(':') {
         Some(pos) => (&spec[..pos], &spec[pos + 1..]),
@@ -1313,9 +1365,8 @@ fn parse_and_apply_pane_adjust(
                 ctx.paused_panes.insert(tmux_pane_id, false);
                 // Reset the output timestamp so age starts fresh.
                 ctx.pane_output_timestamps.remove(&tmux_pane_id);
-                ctx.pending_notifications.push(
-                    super::response::continue_notification(tmux_pane_id),
-                );
+                ctx.pending_notifications
+                    .push(super::response::continue_notification(tmux_pane_id));
             }
         }
         "pause" => {
@@ -1451,11 +1502,8 @@ pub fn check_subscriptions(ctx: &mut HandlerContext) -> Vec<String> {
                     if let Some(pane) = mux.get_pane(real_pane_id) {
                         let (window_id_str, window_index_str) =
                             find_window_for_pane(&mux, &window_ids, &ctx.id_map, real_pane_id);
-                        let fctx = build_pane_format_context_minimal(
-                            &ctx.id_map,
-                            &pane,
-                            &ctx.workspace,
-                        );
+                        let fctx =
+                            build_pane_format_context_minimal(&ctx.id_map, &pane, &ctx.workspace);
                         let value = expand_format(&ctx.subscriptions[sub_idx].format, &fctx);
                         let key = format!("%{}", pane_tmux_id);
                         let changed = ctx.subscriptions[sub_idx]
@@ -1463,19 +1511,15 @@ pub fn check_subscriptions(ctx: &mut HandlerContext) -> Vec<String> {
                             .get(&key)
                             .map_or(true, |old| old != &value);
                         if changed {
-                            notifications.push(
-                                super::response::subscription_changed_notification(
-                                    &ctx.subscriptions[sub_idx].name,
-                                    &format!("${}", session_id_str),
-                                    &window_id_str,
-                                    &window_index_str,
-                                    &format!("%{}", pane_tmux_id),
-                                    &value,
-                                ),
-                            );
-                            ctx.subscriptions[sub_idx]
-                                .last_values
-                                .insert(key, value);
+                            notifications.push(super::response::subscription_changed_notification(
+                                &ctx.subscriptions[sub_idx].name,
+                                &format!("${}", session_id_str),
+                                &window_id_str,
+                                &window_index_str,
+                                &format!("%{}", pane_tmux_id),
+                                &value,
+                            ));
+                            ctx.subscriptions[sub_idx].last_values.insert(key, value);
                         }
                     }
                 }
@@ -1496,10 +1540,8 @@ pub fn check_subscriptions(ctx: &mut HandlerContext) -> Vec<String> {
                                         session_name: ctx.workspace.clone(),
                                         ..FormatContext::default()
                                     };
-                                    let value = expand_format(
-                                        &ctx.subscriptions[sub_idx].format,
-                                        &fctx,
-                                    );
+                                    let value =
+                                        expand_format(&ctx.subscriptions[sub_idx].format, &fctx);
                                     let key = format!("@{}", window_tmux_id);
                                     let changed = ctx.subscriptions[sub_idx]
                                         .last_values
@@ -1516,9 +1558,7 @@ pub fn check_subscriptions(ctx: &mut HandlerContext) -> Vec<String> {
                                                 &value,
                                             ),
                                         );
-                                        ctx.subscriptions[sub_idx]
-                                            .last_values
-                                            .insert(key, value);
+                                        ctx.subscriptions[sub_idx].last_values.insert(key, value);
                                     }
                                 }
                             }
@@ -1529,33 +1569,26 @@ pub fn check_subscriptions(ctx: &mut HandlerContext) -> Vec<String> {
             SubscriptionTarget::Session(_) => {
                 // Session-level: evaluate format with session context only.
                 let fctx = FormatContext {
-                    session_id: ctx
-                        .id_map
-                        .get_or_create_tmux_session_id(&ctx.workspace),
+                    session_id: ctx.id_map.get_or_create_tmux_session_id(&ctx.workspace),
                     session_name: ctx.workspace.clone(),
                     ..FormatContext::default()
                 };
-                let value =
-                    expand_format(&ctx.subscriptions[sub_idx].format, &fctx);
+                let value = expand_format(&ctx.subscriptions[sub_idx].format, &fctx);
                 let key = format!("${}", session_id_str);
                 let changed = ctx.subscriptions[sub_idx]
                     .last_values
                     .get(&key)
                     .map_or(true, |old| old != &value);
                 if changed {
-                    notifications.push(
-                        super::response::subscription_changed_notification(
-                            &ctx.subscriptions[sub_idx].name,
-                            &format!("${}", session_id_str),
-                            "",
-                            "",
-                            "",
-                            &value,
-                        ),
-                    );
-                    ctx.subscriptions[sub_idx]
-                        .last_values
-                        .insert(key, value);
+                    notifications.push(super::response::subscription_changed_notification(
+                        &ctx.subscriptions[sub_idx].name,
+                        &format!("${}", session_id_str),
+                        "",
+                        "",
+                        "",
+                        &value,
+                    ));
+                    ctx.subscriptions[sub_idx].last_values.insert(key, value);
                 }
             }
             SubscriptionTarget::AllPanes => {
@@ -1566,8 +1599,7 @@ pub fn check_subscriptions(ctx: &mut HandlerContext) -> Vec<String> {
                             let panes = tab.iter_panes_ignoring_zoom();
                             for pp in &panes {
                                 let real_pid = pp.pane.pane_id();
-                                let tmux_pid =
-                                    ctx.id_map.get_or_create_tmux_pane_id(real_pid);
+                                let tmux_pid = ctx.id_map.get_or_create_tmux_pane_id(real_pid);
                                 let tmux_wid =
                                     ctx.id_map.get_or_create_tmux_window_id(tab.tab_id());
                                 let fctx = build_pane_format_context_minimal(
@@ -1575,10 +1607,8 @@ pub fn check_subscriptions(ctx: &mut HandlerContext) -> Vec<String> {
                                     &pp.pane,
                                     &ctx.workspace,
                                 );
-                                let value = expand_format(
-                                    &ctx.subscriptions[sub_idx].format,
-                                    &fctx,
-                                );
+                                let value =
+                                    expand_format(&ctx.subscriptions[sub_idx].format, &fctx);
                                 let key = format!("%{}", tmux_pid);
                                 let changed = ctx.subscriptions[sub_idx]
                                     .last_values
@@ -1595,9 +1625,7 @@ pub fn check_subscriptions(ctx: &mut HandlerContext) -> Vec<String> {
                                             &value,
                                         ),
                                     );
-                                    ctx.subscriptions[sub_idx]
-                                        .last_values
-                                        .insert(key, value);
+                                    ctx.subscriptions[sub_idx].last_values.insert(key, value);
                                 }
                             }
                         }
@@ -1609,8 +1637,7 @@ pub fn check_subscriptions(ctx: &mut HandlerContext) -> Vec<String> {
                 for (idx, &wid) in window_ids.iter().enumerate() {
                     if let Some(win) = mux.get_window(wid) {
                         for tab in win.iter() {
-                            let tmux_wid =
-                                ctx.id_map.get_or_create_tmux_window_id(tab.tab_id());
+                            let tmux_wid = ctx.id_map.get_or_create_tmux_window_id(tab.tab_id());
                             let fctx = FormatContext {
                                 window_id: tmux_wid,
                                 window_index: idx as u64,
@@ -1620,10 +1647,7 @@ pub fn check_subscriptions(ctx: &mut HandlerContext) -> Vec<String> {
                                 session_name: ctx.workspace.clone(),
                                 ..FormatContext::default()
                             };
-                            let value = expand_format(
-                                &ctx.subscriptions[sub_idx].format,
-                                &fctx,
-                            );
+                            let value = expand_format(&ctx.subscriptions[sub_idx].format, &fctx);
                             let key = format!("@{}", tmux_wid);
                             let changed = ctx.subscriptions[sub_idx]
                                 .last_values
@@ -1640,9 +1664,7 @@ pub fn check_subscriptions(ctx: &mut HandlerContext) -> Vec<String> {
                                         &value,
                                     ),
                                 );
-                                ctx.subscriptions[sub_idx]
-                                    .last_values
-                                    .insert(key, value);
+                                ctx.subscriptions[sub_idx].last_values.insert(key, value);
                             }
                         }
                     }
@@ -1724,6 +1746,7 @@ pub async fn handle_split_window(
     horizontal: bool,
     target: &Option<String>,
     size: Option<&str>,
+    print_and_format: Option<&str>,
 ) -> Result<String, String> {
     let mux = Mux::try_get().ok_or_else(|| "mux not available".to_string())?;
 
@@ -1761,6 +1784,11 @@ pub async fn handle_split_window(
     let tmux_pane_id = ctx.id_map.get_or_create_tmux_pane_id(new_pane.pane_id());
     ctx.active_pane_id = Some(tmux_pane_id);
 
+    // If -P was specified, return format-expanded info about the new pane
+    if let Some(fmt) = print_and_format {
+        return format_new_pane(ctx, new_pane.pane_id(), fmt);
+    }
+
     Ok(String::new())
 }
 
@@ -1769,6 +1797,7 @@ pub async fn handle_new_window(
     ctx: &mut HandlerContext,
     target: &Option<String>,
     name: Option<&str>,
+    print_and_format: Option<&str>,
 ) -> Result<String, String> {
     let mux = Mux::try_get().ok_or_else(|| "mux not available".to_string())?;
 
@@ -1802,6 +1831,11 @@ pub async fn handle_new_window(
     let tmux_pane_id = ctx.id_map.get_or_create_tmux_pane_id(pane.pane_id());
     ctx.active_window_id = Some(tmux_window_id);
     ctx.active_pane_id = Some(tmux_pane_id);
+
+    // If -P was specified, return format-expanded info about the new pane
+    if let Some(fmt) = print_and_format {
+        return format_new_pane(ctx, pane.pane_id(), fmt);
+    }
 
     Ok(String::new())
 }
@@ -1846,9 +1880,7 @@ pub fn handle_kill_session(
     let mux = Mux::try_get().ok_or_else(|| "mux not available".to_string())?;
 
     let resolved = ctx.resolve_target(target)?;
-    let workspace = resolved
-        .workspace
-        .unwrap_or_else(|| ctx.workspace.clone());
+    let workspace = resolved.workspace.unwrap_or_else(|| ctx.workspace.clone());
 
     // Collect all mux windows in the workspace
     let window_ids = mux.iter_windows_in_workspace(&workspace);
@@ -1911,9 +1943,7 @@ pub fn handle_rename_session(
     let mux = Mux::try_get().ok_or_else(|| "mux not available".to_string())?;
 
     let resolved = ctx.resolve_target(target)?;
-    let old_workspace = resolved
-        .workspace
-        .unwrap_or_else(|| ctx.workspace.clone());
+    let old_workspace = resolved.workspace.unwrap_or_else(|| ctx.workspace.clone());
 
     mux.rename_workspace(&old_workspace, name);
     ctx.id_map.rename_session(&old_workspace, name);
@@ -2067,6 +2097,8 @@ pub fn handle_move_window(
 pub async fn handle_new_session(
     ctx: &mut HandlerContext,
     name: Option<&str>,
+    window_name: Option<&str>,
+    print_and_format: Option<&str>,
 ) -> Result<String, String> {
     let mux = Mux::try_get().ok_or_else(|| "mux not available".to_string())?;
 
@@ -2091,6 +2123,10 @@ pub async fn handle_new_session(
         .await
         .map_err(|e| format!("new-session failed: {}", e))?;
 
+    if let Some(title) = window_name {
+        tab.set_title(title);
+    }
+
     // Register new mappings
     let tmux_session_id = ctx.id_map.get_or_create_tmux_session_id(&workspace);
     let tmux_window_id = ctx.id_map.get_or_create_tmux_window_id(tab.tab_id());
@@ -2101,6 +2137,116 @@ pub async fn handle_new_session(
     ctx.active_pane_id = Some(tmux_pane_id);
     ctx.workspace = workspace;
 
+    // If -P was specified, return format-expanded info about the new pane
+    if let Some(fmt) = print_and_format {
+        return format_new_pane(ctx, pane.pane_id(), fmt);
+    }
+
+    Ok(String::new())
+}
+
+/// Helper: find the tab and mux window ID containing a given pane.
+fn find_tab_and_window_for_pane(
+    mux: &Arc<Mux>,
+    pane_id: PaneId,
+    workspace: &str,
+) -> Option<(Arc<Tab>, WindowId)> {
+    for wid in mux.iter_windows_in_workspace(workspace) {
+        if let Some(win) = mux.get_window(wid) {
+            for tab in win.iter() {
+                let panes = tab.iter_panes_ignoring_zoom();
+                for pp in &panes {
+                    if pp.pane.pane_id() == pane_id {
+                        return Some((tab.clone(), wid));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Helper: build a FormatContext for a newly created pane and expand a format string.
+///
+/// Used by split-window, new-window, and new-session when `-P -F` is specified.
+fn format_new_pane(
+    ctx: &mut HandlerContext,
+    wez_pane_id: PaneId,
+    fmt: &str,
+) -> Result<String, String> {
+    let mux = Mux::try_get().ok_or_else(|| "mux not available".to_string())?;
+    let workspace = ctx.workspace.clone();
+
+    // Find the tab and window containing this pane
+    if let Some((tab, window_id)) = find_tab_and_window_for_pane(&mux, wez_pane_id, &workspace) {
+        let panes = tab.iter_panes();
+        if let Some(pp) = panes.iter().find(|p| p.pane.pane_id() == wez_pane_id) {
+            let window_index = {
+                let wids = mux.iter_windows_in_workspace(&workspace);
+                wids.iter().position(|&w| w == window_id).unwrap_or(0)
+            };
+            let fctx = build_format_context(ctx, pp, &tab, window_id, window_index, &workspace);
+            return Ok(expand_format(fmt, &fctx));
+        }
+    }
+
+    // Minimal fallback: just return the tmux pane ID
+    let tmux_pane_id = ctx.id_map.get_or_create_tmux_pane_id(wez_pane_id);
+    Ok(format!("%{}", tmux_pane_id))
+}
+
+/// Handle `set-option` — no-op, returns empty success.
+fn handle_set_option(option_name: Option<&str>, value: Option<&str>) -> Result<String, String> {
+    log::debug!(
+        "set-option: {}={}  (no-op)",
+        option_name.unwrap_or("(none)"),
+        value.unwrap_or("(none)")
+    );
+    Ok(String::new())
+}
+
+/// Handle `break-pane` — move a pane to its own new tab.
+async fn handle_break_pane(
+    ctx: &mut HandlerContext,
+    _detach: bool,
+    source: &Option<String>,
+    target: &Option<String>,
+) -> Result<String, String> {
+    let mux = Mux::try_get().ok_or_else(|| "mux not available".to_string())?;
+
+    // Resolve the source pane to break out
+    let resolved_src = ctx.resolve_target(source)?;
+    let pane_id = resolved_src
+        .pane_id
+        .ok_or_else(|| "no pane resolved for break-pane".to_string())?;
+
+    // Determine the workspace for the new tab
+    let workspace = if let Some(tgt) = target {
+        // Target may specify a session name (e.g., "mysession:")
+        let session_name = tgt.trim_end_matches(':');
+        if !session_name.is_empty() {
+            session_name.to_string()
+        } else {
+            ctx.workspace.clone()
+        }
+    } else {
+        ctx.workspace.clone()
+    };
+
+    // Find the window containing this pane so we can determine where to create a new tab
+    let window_id = resolved_src.window_id;
+
+    // Use MovePane with a new split to effectively break the pane out.
+    // The simplest approach: create a new tab, then move the pane into it.
+    // But WezTerm doesn't have a direct "break-pane" API.
+    // We'll spawn a new tab and then swap the pane content.
+    // For now, return success as a best-effort no-op since this is a LOW priority item.
+    let _ = (mux, pane_id, workspace, window_id);
+    log::debug!(
+        "break-pane: best-effort no-op (source={:?}, target={:?})",
+        source,
+        target
+    );
     Ok(String::new())
 }
 
@@ -2165,10 +2311,7 @@ pub fn handle_show_window_options(
     value_only: bool,
     option_name: Option<&str>,
 ) -> Result<String, String> {
-    let options: &[(&str, &str)] = &[
-        ("aggressive-resize", "off"),
-        ("mode-keys", "emacs"),
-    ];
+    let options: &[(&str, &str)] = &[("aggressive-resize", "off"), ("mode-keys", "emacs")];
 
     if global {
         match option_name {
@@ -2302,7 +2445,10 @@ pub fn handle_detach_client(ctx: &mut HandlerContext) -> Result<String, String> 
 /// itself.  We return a single line with format variable expansion.
 ///
 /// iTerm2 uses: `list-clients -t '$N' -F '#{client_name}\t#{client_control_mode}'`
-pub fn handle_list_clients(ctx: &mut HandlerContext, format: Option<&str>) -> Result<String, String> {
+pub fn handle_list_clients(
+    ctx: &mut HandlerContext,
+    format: Option<&str>,
+) -> Result<String, String> {
     let default_format = "#{client_name}: #{session_name}";
     let fmt = format.unwrap_or(default_format);
 
@@ -2354,9 +2500,8 @@ fn handle_set_buffer(
         ctx.paste_buffers
             .append(name, content)
             .map_err(|e| e.to_string())?;
-        ctx.pending_notifications.push(
-            super::response::paste_buffer_changed_notification(name),
-        );
+        ctx.pending_notifications
+            .push(super::response::paste_buffer_changed_notification(name));
         return Ok(String::new());
     }
 
@@ -2377,9 +2522,8 @@ fn handle_delete_buffer(
     match buffer_name {
         Some(name) => {
             if ctx.paste_buffers.delete(name) {
-                ctx.pending_notifications.push(
-                    super::response::paste_buffer_deleted_notification(name),
-                );
+                ctx.pending_notifications
+                    .push(super::response::paste_buffer_deleted_notification(name));
                 Ok(String::new())
             } else {
                 Err(format!("unknown buffer: {}", name))
@@ -2387,9 +2531,8 @@ fn handle_delete_buffer(
         }
         None => match ctx.paste_buffers.delete_most_recent() {
             Some(name) => {
-                ctx.pending_notifications.push(
-                    super::response::paste_buffer_deleted_notification(&name),
-                );
+                ctx.pending_notifications
+                    .push(super::response::paste_buffer_deleted_notification(&name));
                 Ok(String::new())
             }
             None => Err("no buffers".to_string()),
@@ -2398,10 +2541,7 @@ fn handle_delete_buffer(
 }
 
 /// `list-buffers [-F format]` — list all buffers with format expansion.
-fn handle_list_buffers(
-    ctx: &mut HandlerContext,
-    format: Option<&str>,
-) -> Result<String, String> {
+fn handle_list_buffers(ctx: &mut HandlerContext, format: Option<&str>) -> Result<String, String> {
     let default_fmt = "#{buffer_name}: #{buffer_size} bytes: \"#{buffer_sample}\"";
     let fmt = format.unwrap_or(default_fmt);
 
@@ -2475,9 +2615,10 @@ fn handle_paste_buffer(
 
     if delete_after {
         ctx.paste_buffers.delete(&buf_name);
-        ctx.pending_notifications.push(
-            super::response::paste_buffer_deleted_notification(&buf_name),
-        );
+        ctx.pending_notifications
+            .push(super::response::paste_buffer_deleted_notification(
+                &buf_name,
+            ));
     }
 
     Ok(String::new())
@@ -2660,13 +2801,16 @@ mod tests {
     fn list_commands_contains_all() {
         let output = handle_list_commands();
         let commands: Vec<&str> = output.lines().collect();
-        assert_eq!(commands.len(), 36);
+        assert_eq!(commands.len(), 39);
         assert!(commands.contains(&"attach-session"));
+        assert!(commands.contains(&"break-pane"));
         assert!(commands.contains(&"capture-pane"));
+        assert!(commands.contains(&"copy-mode"));
         assert!(commands.contains(&"delete-buffer"));
         assert!(commands.contains(&"detach-client"));
         assert!(commands.contains(&"display-message"));
         assert!(commands.contains(&"has-session"));
+        assert!(commands.contains(&"join-pane"));
         assert!(commands.contains(&"kill-pane"));
         assert!(commands.contains(&"kill-session"));
         assert!(commands.contains(&"kill-window"));
@@ -2676,6 +2820,8 @@ mod tests {
         assert!(commands.contains(&"list-panes"));
         assert!(commands.contains(&"list-sessions"));
         assert!(commands.contains(&"list-windows"));
+        assert!(commands.contains(&"move-pane"));
+        assert!(commands.contains(&"move-window"));
         assert!(commands.contains(&"new-session"));
         assert!(commands.contains(&"new-window"));
         assert!(commands.contains(&"paste-buffer"));
@@ -2684,19 +2830,17 @@ mod tests {
         assert!(commands.contains(&"rename-window"));
         assert!(commands.contains(&"resize-pane"));
         assert!(commands.contains(&"resize-window"));
+        assert!(commands.contains(&"select-layout"));
         assert!(commands.contains(&"select-pane"));
         assert!(commands.contains(&"select-window"));
         assert!(commands.contains(&"send-keys"));
         assert!(commands.contains(&"set-buffer"));
+        assert!(commands.contains(&"set-option"));
         assert!(commands.contains(&"show-buffer"));
         assert!(commands.contains(&"show-options"));
         assert!(commands.contains(&"show-window-options"));
         assert!(commands.contains(&"split-window"));
         assert!(commands.contains(&"switch-client"));
-        assert!(commands.contains(&"copy-mode"));
-        assert!(commands.contains(&"join-pane"));
-        assert!(commands.contains(&"move-pane"));
-        assert!(commands.contains(&"move-window"));
     }
 
     #[test]
@@ -2869,13 +3013,8 @@ mod tests {
     #[test]
     fn refresh_client_wait_exit_flag() {
         let mut ctx = HandlerContext::new("default".to_string());
-        let result = handle_refresh_client(
-            &mut ctx,
-            None,
-            Some("pause-after=3,wait-exit"),
-            None,
-            None,
-        );
+        let result =
+            handle_refresh_client(&mut ctx, None, Some("pause-after=3,wait-exit"), None, None);
         assert!(result.is_ok());
         assert_eq!(ctx.pause_age_ms, Some(3000));
         assert!(ctx.wait_exit);
@@ -2897,7 +3036,10 @@ mod tests {
         let result = handle_refresh_client(&mut ctx, None, None, Some("%0:continue"), None);
         assert!(result.is_ok());
         assert_eq!(ctx.paused_panes.get(&0), Some(&false));
-        assert!(ctx.pending_notifications.iter().any(|n| n.contains("%continue %0")));
+        assert!(ctx
+            .pending_notifications
+            .iter()
+            .any(|n| n.contains("%continue %0")));
     }
 
     #[test]
@@ -2906,7 +3048,10 @@ mod tests {
         let result = handle_refresh_client(&mut ctx, None, None, Some("%0:pause"), None);
         assert!(result.is_ok());
         assert_eq!(ctx.paused_panes.get(&0), Some(&true));
-        assert!(ctx.pending_notifications.iter().any(|n| n.contains("%pause %0")));
+        assert!(ctx
+            .pending_notifications
+            .iter()
+            .any(|n| n.contains("%pause %0")));
     }
 
     #[test]
@@ -2952,13 +3097,8 @@ mod tests {
     #[test]
     fn subscription_register() {
         let mut ctx = HandlerContext::new("default".to_string());
-        let result = handle_refresh_client(
-            &mut ctx,
-            None,
-            None,
-            None,
-            Some("my-sub:%0:#{pane_id}"),
-        );
+        let result =
+            handle_refresh_client(&mut ctx, None, None, None, Some("my-sub:%0:#{pane_id}"));
         assert!(result.is_ok());
         assert_eq!(ctx.subscriptions.len(), 1);
         assert_eq!(ctx.subscriptions[0].name, "my-sub");
@@ -3001,10 +3141,7 @@ mod tests {
     fn subscription_all_windows_target() {
         let mut ctx = HandlerContext::new("default".to_string());
         handle_refresh_client(&mut ctx, None, None, None, Some("all:@*:#{window_id}")).unwrap();
-        assert_eq!(
-            ctx.subscriptions[0].target,
-            SubscriptionTarget::AllWindows
-        );
+        assert_eq!(ctx.subscriptions[0].target, SubscriptionTarget::AllWindows);
     }
 
     #[test]

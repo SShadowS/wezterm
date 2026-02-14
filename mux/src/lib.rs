@@ -110,8 +110,9 @@ static SUB_ID: AtomicUsize = AtomicUsize::new(0);
 /// `parse_buffered_data`, the raw bytes (plus timestamp) are cloned to each
 /// registered sender.  Senders that fail (disconnected) are automatically
 /// pruned.
-static OUTPUT_TAPS: Mutex<Option<HashMap<PaneId, Vec<std::sync::mpsc::SyncSender<(Vec<u8>, Instant)>>>>>
-    = Mutex::new(None);
+static OUTPUT_TAPS: Mutex<
+    Option<HashMap<PaneId, Vec<std::sync::mpsc::SyncSender<(Vec<u8>, Instant)>>>>,
+> = Mutex::new(None);
 
 /// Register an output tap for a specific pane.
 ///

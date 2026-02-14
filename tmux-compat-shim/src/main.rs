@@ -64,8 +64,11 @@ fn parse_args(args: &[String]) -> Action {
     }
 
     // Detect session management commands.
+    // attach-session/attach/a are no-ops (we're already in a session).
+    // new-session/new are forwarded to the server so they can create workspaces
+    // and return pane IDs when -P is specified.
     match rest[0].as_str() {
-        "new-session" | "new" | "attach-session" | "attach" | "a" => {
+        "attach-session" | "attach" | "a" => {
             return Action::SessionNoOp;
         }
         _ => {}
@@ -323,7 +326,6 @@ fn run_cc_exchange(
 fn execute_command(socket_path: &str, command: &str) -> anyhow::Result<CcResponse> {
     let verbose = std::env::var("WEZTERM_TMUX_CC_VERBOSE").is_ok();
 
-
     if let Some(addr) = socket_path.strip_prefix("tcp:") {
         let stream = std::net::TcpStream::connect(addr).map_err(|e| {
             anyhow::anyhow!("failed to connect to WezTerm CC server at {}: {}", addr, e)
@@ -465,9 +467,10 @@ mod tests {
 
     #[test]
     fn parse_session_new() {
+        // new-session is now forwarded to the server (not a no-op)
         match parse_args(&args(&["tmux", "-CC", "new-session", "-t", "main"])) {
-            Action::SessionNoOp => {}
-            _ => panic!("expected SessionNoOp"),
+            Action::Command(cmd) => assert_eq!(cmd, "new-session -t main"),
+            _ => panic!("expected Command"),
         }
     }
 

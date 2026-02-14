@@ -323,11 +323,7 @@ impl IdMap {
         let snapshot: IdMapSnapshot = match serde_json::from_str(&json) {
             Ok(s) => s,
             Err(e) => {
-                log::warn!(
-                    "tmux id-map: failed to parse {}: {}",
-                    path.display(),
-                    e
-                );
+                log::warn!("tmux id-map: failed to parse {}: {}", path.display(), e);
                 return IdMap::new();
             }
         };
@@ -383,7 +379,13 @@ fn id_map_path(workspace: &str) -> Option<PathBuf> {
     // Sanitize workspace name for use as a filename.
     let safe_name: String = workspace
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     Some(config::CACHE_DIR.join(format!("tmux-id-map-{}.json", safe_name)))
 }
@@ -639,11 +641,7 @@ mod tests {
 
         // Serialize to JSON and back via IdMapSnapshot.
         let snapshot = IdMapSnapshot {
-            pane_mappings: map
-                .wez_to_tmux_pane
-                .iter()
-                .map(|(&w, &t)| (w, t))
-                .collect(),
+            pane_mappings: map.wez_to_tmux_pane.iter().map(|(&w, &t)| (w, t)).collect(),
             window_mappings: map
                 .wez_to_tmux_window
                 .iter()

@@ -23,7 +23,6 @@ use super::response::{
     ResponseWriter,
 };
 
-
 // ---------------------------------------------------------------------------
 // TmuxCompatSession
 // ---------------------------------------------------------------------------
@@ -333,8 +332,10 @@ pub fn translate_notification(
             new_workspace,
         } => {
             // Re-key the session mapping and emit %session-renamed
-            if let Some(tmux_sid) =
-                session.ctx.id_map.rename_session(&old_workspace, &new_workspace)
+            if let Some(tmux_sid) = session
+                .ctx
+                .id_map
+                .rename_session(&old_workspace, &new_workspace)
             {
                 Some(session_renamed_notification(tmux_sid, &new_workspace))
             } else {
@@ -361,10 +362,7 @@ pub fn translate_notification(
 
             if prev.is_some() && prev != Some(active_tab_id) {
                 // Active tab actually changed — emit notification
-                let tmux_sid = session
-                    .ctx
-                    .id_map
-                    .get_or_create_tmux_session_id(&workspace);
+                let tmux_sid = session.ctx.id_map.get_or_create_tmux_session_id(&workspace);
                 let tmux_wid = session
                     .ctx
                     .id_map
@@ -578,8 +576,7 @@ fn process_cc_connection_sync(
 
         // Dispatch the command on the main thread via spawn_local.
         let cmd_line = trimmed;
-        let mut ctx =
-            std::mem::replace(&mut session.ctx, HandlerContext::new(String::new()));
+        let mut ctx = std::mem::replace(&mut session.ctx, HandlerContext::new(String::new()));
         let (resp_tx, resp_rx) = std::sync::mpsc::sync_channel(1);
         promise::spawn::spawn_into_main_thread(async move {
             promise::spawn::spawn(async move {
@@ -657,8 +654,6 @@ fn process_cc_connection_sync(
     }
 }
 
-
-
 // ---------------------------------------------------------------------------
 // Listener
 // ---------------------------------------------------------------------------
@@ -693,10 +688,7 @@ fn start_tmux_compat_listener_tcp() -> anyhow::Result<String> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     let addr = listener.local_addr()?;
     let addr_str = format!("tcp:{}", addr);
-    log::info!(
-        "tmux CC compat listener started on {}",
-        addr_str
-    );
+    log::info!("tmux CC compat listener started on {}", addr_str);
 
     let addr_for_thread = addr_str.clone();
     let _thread = std::thread::Builder::new()
@@ -739,10 +731,7 @@ fn start_tmux_compat_listener_uds(socket_path: &std::path::Path) -> anyhow::Resu
 
     let listener = wezterm_uds::UnixListener::bind(socket_path)?;
     let addr_str = socket_path.to_string_lossy().to_string();
-    log::info!(
-        "tmux CC compat listener started on {}",
-        addr_str
-    );
+    log::info!("tmux CC compat listener started on {}", addr_str);
 
     let addr_for_thread = addr_str.clone();
     let _thread = std::thread::Builder::new()
@@ -771,8 +760,6 @@ fn start_tmux_compat_listener_uds(socket_path: &std::path::Path) -> anyhow::Resu
 
     Ok(addr_str)
 }
-
-
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -972,10 +959,7 @@ mod tests {
             new_workspace: "new".to_string(),
         };
         let result = translate_notification(&mut session, notif);
-        assert_eq!(
-            result,
-            Some(session_renamed_notification(0, "new"))
-        );
+        assert_eq!(result, Some(session_renamed_notification(0, "new")));
         // Verify id_map was re-keyed
         assert_eq!(session.ctx.id_map.tmux_session_id("old"), None);
         assert_eq!(session.ctx.id_map.tmux_session_id("new"), Some(0));
@@ -997,17 +981,10 @@ mod tests {
         // Set up: register two tabs in mux window 1
         let tmux_w0 = session.ctx.id_map.get_or_create_tmux_window_id(10);
         let tmux_w1 = session.ctx.id_map.get_or_create_tmux_window_id(20);
-        session
-            .ctx
-            .id_map
-            .track_tab_in_window(1, 10, "test");
-        session
-            .ctx
-            .id_map
-            .track_tab_in_window(1, 20, "test");
+        session.ctx.id_map.track_tab_in_window(1, 10, "test");
+        session.ctx.id_map.track_tab_in_window(1, 20, "test");
 
-        let result =
-            translate_notification(&mut session, MuxNotification::WindowRemoved(1));
+        let result = translate_notification(&mut session, MuxNotification::WindowRemoved(1));
         let out = result.unwrap();
         // Should contain %window-close for both tabs
         assert!(out.contains(&format!("%window-close @{}", tmux_w0)));
@@ -1030,9 +1007,7 @@ mod tests {
     fn translate_window_created_without_mux_returns_none() {
         let mut session = TmuxCompatSession::new("test".to_string());
         // Without Mux singleton, WindowCreated can't look up workspace
-        assert!(
-            translate_notification(&mut session, MuxNotification::WindowCreated(1)).is_none()
-        );
+        assert!(translate_notification(&mut session, MuxNotification::WindowCreated(1)).is_none());
     }
 
     // --- Phase 9: %paste-buffer-changed tests ---
@@ -1076,8 +1051,7 @@ mod tests {
     fn translate_window_invalidated_suppressed() {
         let mut session = TmuxCompatSession::new("test".to_string());
         session.ctx.suppress_window_changed = 2;
-        let result =
-            translate_notification(&mut session, MuxNotification::WindowInvalidated(1));
+        let result = translate_notification(&mut session, MuxNotification::WindowInvalidated(1));
         assert!(result.is_none());
         assert_eq!(session.ctx.suppress_window_changed, 1);
     }
@@ -1089,8 +1063,7 @@ mod tests {
         translate_notification(&mut session, MuxNotification::WindowInvalidated(1));
         assert_eq!(session.ctx.suppress_window_changed, 0);
         // Next one should NOT be suppressed (but will return None without Mux)
-        let result =
-            translate_notification(&mut session, MuxNotification::WindowInvalidated(1));
+        let result = translate_notification(&mut session, MuxNotification::WindowInvalidated(1));
         // Without Mux, returns None (can't look up window)
         assert!(result.is_none());
         assert_eq!(session.ctx.suppress_window_changed, 0);

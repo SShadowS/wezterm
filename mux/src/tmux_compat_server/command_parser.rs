@@ -14,6 +14,7 @@ pub enum TmuxCliCommand {
         vertical: bool,
         target: Option<String>,
         size: Option<String>,
+        print_and_format: Option<String>,
     },
     SendKeys {
         target: Option<String>,
@@ -46,12 +47,15 @@ pub enum TmuxCliCommand {
     NewWindow {
         target: Option<String>,
         name: Option<String>,
+        print_and_format: Option<String>,
     },
     SelectWindow {
         target: Option<String>,
     },
     SelectPane {
         target: Option<String>,
+        style: Option<String>,
+        title: Option<String>,
     },
     KillPane {
         target: Option<String>,
@@ -76,6 +80,7 @@ pub enum TmuxCliCommand {
     DisplayMessage {
         print: bool,
         format: Option<String>,
+        target: Option<String>,
     },
     HasSession {
         target: Option<String>,
@@ -97,6 +102,9 @@ pub enum TmuxCliCommand {
     },
     NewSession {
         name: Option<String>,
+        window_name: Option<String>,
+        detached: bool,
+        print_and_format: Option<String>,
     },
     ShowOptions {
         global: bool,
@@ -154,6 +162,21 @@ pub enum TmuxCliCommand {
     // Phase 12.4: copy mode bridge
     CopyMode {
         quit: bool,
+        target: Option<String>,
+    },
+    // Phase 13: Claude Code agent teams compatibility
+    SetOption {
+        target: Option<String>,
+        option_name: Option<String>,
+        value: Option<String>,
+    },
+    SelectLayout {
+        target: Option<String>,
+        layout_name: Option<String>,
+    },
+    BreakPane {
+        detach: bool,
+        source: Option<String>,
         target: Option<String>,
     },
 }
@@ -214,6 +237,10 @@ pub fn parse_command(line: &str) -> Result<TmuxCliCommand> {
         "move-pane" | "movep" | "join-pane" | "joinp" => parse_move_pane(args),
         "move-window" | "movew" => parse_move_window(args),
         "copy-mode" => parse_copy_mode(args),
+        // Phase 13: Claude Code agent teams compatibility
+        "set-option" | "set" => parse_set_option(args),
+        "select-layout" | "selectl" => parse_select_layout(args),
+        "break-pane" | "breakp" => parse_break_pane(args),
         other => bail!("unknown tmux command: {other:?}"),
     }
 }
@@ -234,6 +261,8 @@ fn parse_split_window(args: &[String]) -> Result<TmuxCliCommand> {
     let mut vertical = false;
     let mut target = None;
     let mut size = None;
+    let mut print_info = false;
+    let mut format = None;
 
     let strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     let mut iter = strs.iter().copied();
@@ -242,16 +271,35 @@ fn parse_split_window(args: &[String]) -> Result<TmuxCliCommand> {
             "-h" => horizontal = true,
             "-v" => vertical = true,
             "-t" => target = Some(take_flag_value("-t", &mut iter)?),
-            "-l" => size = Some(take_flag_value("-l", &mut iter)?),
+            "-l" | "-p" => size = Some(take_flag_value(arg, &mut iter)?),
+            "-P" => print_info = true,
+            "-F" => format = Some(take_flag_value("-F", &mut iter)?),
+            // Flags we accept but ignore: -d (detach), -b (before), -f (full-width/height)
+            "-d" | "-b" | "-f" | "-Z" | "-I" => {}
+            // -e takes a value (environment) — ignore
+            "-e" => {
+                let _ = take_flag_value("-e", &mut iter)?;
+            }
+            // -c takes a value (start directory) — ignore
+            "-c" => {
+                let _ = take_flag_value("-c", &mut iter)?;
+            }
             other => bail!("split-window: unexpected argument: {other:?}"),
         }
     }
+
+    let print_and_format = if print_info {
+        Some(format.unwrap_or_else(|| "#{session_name}:#{window_index}.#{pane_index}".to_string()))
+    } else {
+        None
+    };
 
     Ok(TmuxCliCommand::SplitWindow {
         horizontal,
         vertical,
         target,
         size,
+        print_and_format,
     })
 }
 
@@ -397,6 +445,8 @@ fn parse_list_sessions(args: &[String]) -> Result<TmuxCliCommand> {
 fn parse_new_window(args: &[String]) -> Result<TmuxCliCommand> {
     let mut target = None;
     let mut name = None;
+    let mut print_info = false;
+    let mut format = None;
 
     let strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     let mut iter = strs.iter().copied();
@@ -404,11 +454,31 @@ fn parse_new_window(args: &[String]) -> Result<TmuxCliCommand> {
         match arg {
             "-t" => target = Some(take_flag_value("-t", &mut iter)?),
             "-n" => name = Some(take_flag_value("-n", &mut iter)?),
+            "-P" => print_info = true,
+            "-F" => format = Some(take_flag_value("-F", &mut iter)?),
+            // Flags we accept but ignore
+            "-d" | "-S" | "-a" | "-b" | "-k" => {}
+            "-e" => {
+                let _ = take_flag_value("-e", &mut iter)?;
+            }
+            "-c" => {
+                let _ = take_flag_value("-c", &mut iter)?;
+            }
             other => bail!("new-window: unexpected argument: {other:?}"),
         }
     }
 
-    Ok(TmuxCliCommand::NewWindow { target, name })
+    let print_and_format = if print_info {
+        Some(format.unwrap_or_else(|| "#{session_name}:#{window_index}.#{pane_index}".to_string()))
+    } else {
+        None
+    };
+
+    Ok(TmuxCliCommand::NewWindow {
+        target,
+        name,
+        print_and_format,
+    })
 }
 
 fn parse_select_window(args: &[String]) -> Result<TmuxCliCommand> {
@@ -428,17 +498,27 @@ fn parse_select_window(args: &[String]) -> Result<TmuxCliCommand> {
 
 fn parse_select_pane(args: &[String]) -> Result<TmuxCliCommand> {
     let mut target = None;
+    let mut style = None;
+    let mut title = None;
 
     let strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     let mut iter = strs.iter().copied();
     while let Some(arg) = iter.next() {
         match arg {
             "-t" => target = Some(take_flag_value("-t", &mut iter)?),
+            "-T" => title = Some(take_flag_value("-T", &mut iter)?),
+            "-P" => style = Some(take_flag_value("-P", &mut iter).unwrap_or_default()),
+            // Flags we accept but ignore
+            "-e" | "-d" | "-D" | "-l" | "-M" | "-m" | "-Z" | "-U" | "-R" | "-L" => {}
             other => bail!("select-pane: unexpected argument: {other:?}"),
         }
     }
 
-    Ok(TmuxCliCommand::SelectPane { target })
+    Ok(TmuxCliCommand::SelectPane {
+        target,
+        style,
+        title,
+    })
 }
 
 fn parse_kill_pane(args: &[String]) -> Result<TmuxCliCommand> {
@@ -470,18 +550,25 @@ fn parse_resize_pane(args: &[String]) -> Result<TmuxCliCommand> {
             "-Z" => zoom = true,
             "-x" => {
                 let val = take_flag_value("-x", &mut iter)?;
+                // Strip trailing '%' — percentage sizes will be resolved by the handler
+                let val_clean = val.strip_suffix('%').unwrap_or(&val);
                 width = Some(
-                    val.parse::<u64>()
+                    val_clean
+                        .parse::<u64>()
                         .map_err(|_| anyhow::anyhow!("resize-pane -x: invalid number: {val:?}"))?,
                 );
             }
             "-y" => {
                 let val = take_flag_value("-y", &mut iter)?;
+                let val_clean = val.strip_suffix('%').unwrap_or(&val);
                 height = Some(
-                    val.parse::<u64>()
+                    val_clean
+                        .parse::<u64>()
                         .map_err(|_| anyhow::anyhow!("resize-pane -y: invalid number: {val:?}"))?,
                 );
             }
+            // Flags we accept but ignore: -D/-U/-L/-R (relative resize directions)
+            "-D" | "-U" | "-L" | "-R" | "-M" => {}
             other => bail!("resize-pane: unexpected argument: {other:?}"),
         }
     }
@@ -558,12 +645,19 @@ fn parse_refresh_client(args: &[String]) -> Result<TmuxCliCommand> {
 fn parse_display_message(args: &[String]) -> Result<TmuxCliCommand> {
     let mut print = false;
     let mut format = None;
+    let mut target = None;
 
     let strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     let mut iter = strs.iter().copied();
     while let Some(arg) = iter.next() {
         match arg {
             "-p" => print = true,
+            "-t" => target = Some(take_flag_value("-t", &mut iter)?),
+            // Flags we accept but ignore
+            "-v" | "-a" | "-I" | "-N" => {}
+            "-c" => {
+                let _ = take_flag_value("-c", &mut iter)?;
+            }
             _ => {
                 // The first non-flag argument is the format string.
                 // tmux display-message takes at most one positional argument.
@@ -572,7 +666,11 @@ fn parse_display_message(args: &[String]) -> Result<TmuxCliCommand> {
         }
     }
 
-    Ok(TmuxCliCommand::DisplayMessage { print, format })
+    Ok(TmuxCliCommand::DisplayMessage {
+        print,
+        format,
+        target,
+    })
 }
 
 fn parse_has_session(args: &[String]) -> Result<TmuxCliCommand> {
@@ -662,17 +760,56 @@ fn parse_rename_session(args: &[String]) -> Result<TmuxCliCommand> {
 
 fn parse_new_session(args: &[String]) -> Result<TmuxCliCommand> {
     let mut name = None;
+    let mut window_name = None;
+    let mut detached = false;
+    let mut print_info = false;
+    let mut format = None;
 
     let strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     let mut iter = strs.iter().copied();
     while let Some(arg) = iter.next() {
         match arg {
             "-s" => name = Some(take_flag_value("-s", &mut iter)?),
+            "-n" => window_name = Some(take_flag_value("-n", &mut iter)?),
+            "-d" => detached = true,
+            "-P" => print_info = true,
+            "-F" => format = Some(take_flag_value("-F", &mut iter)?),
+            // Flags we accept but ignore
+            "-A" | "-D" | "-E" | "-X" => {}
+            "-t" => {
+                let _ = take_flag_value("-t", &mut iter)?;
+            }
+            "-x" => {
+                let _ = take_flag_value("-x", &mut iter)?;
+            }
+            "-y" => {
+                let _ = take_flag_value("-y", &mut iter)?;
+            }
+            "-e" => {
+                let _ = take_flag_value("-e", &mut iter)?;
+            }
+            "-c" => {
+                let _ = take_flag_value("-c", &mut iter)?;
+            }
+            "-f" => {
+                let _ = take_flag_value("-f", &mut iter)?;
+            }
             other => bail!("new-session: unexpected argument: {other:?}"),
         }
     }
 
-    Ok(TmuxCliCommand::NewSession { name })
+    let print_and_format = if print_info {
+        Some(format.unwrap_or_else(|| "#{session_name}:#{window_index}.#{pane_index}".to_string()))
+    } else {
+        None
+    };
+
+    Ok(TmuxCliCommand::NewSession {
+        name,
+        window_name,
+        detached,
+        print_and_format,
+    })
 }
 
 fn parse_show_options(args: &[String]) -> Result<TmuxCliCommand> {
@@ -990,6 +1127,96 @@ fn parse_copy_mode(args: &[String]) -> Result<TmuxCliCommand> {
     Ok(TmuxCliCommand::CopyMode { quit, target })
 }
 
+// Phase 13: Claude Code agent teams compatibility — new parsers
+
+fn parse_set_option(args: &[String]) -> Result<TmuxCliCommand> {
+    let mut target = None;
+    let mut option_name = None;
+    let mut value = None;
+
+    let strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let mut iter = strs.iter().copied();
+    while let Some(arg) = iter.next() {
+        match arg {
+            "-t" => target = Some(take_flag_value("-t", &mut iter)?),
+            // Scope flags — accept but ignore (we always treat as no-op)
+            "-g" | "-s" | "-w" | "-p" | "-q" | "-o" | "-u" | "-U" | "-a" | "-F" => {}
+            _ => {
+                // First positional = option name, second = value
+                if option_name.is_none() {
+                    option_name = Some(arg.to_string());
+                } else if value.is_none() {
+                    value = Some(arg.to_string());
+                }
+                // Extra positionals are silently ignored
+            }
+        }
+    }
+
+    Ok(TmuxCliCommand::SetOption {
+        target,
+        option_name,
+        value,
+    })
+}
+
+fn parse_select_layout(args: &[String]) -> Result<TmuxCliCommand> {
+    let mut target = None;
+    let mut layout_name = None;
+
+    let strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let mut iter = strs.iter().copied();
+    while let Some(arg) = iter.next() {
+        match arg {
+            "-t" => target = Some(take_flag_value("-t", &mut iter)?),
+            // Flags we accept but ignore
+            "-E" | "-n" | "-o" | "-p" => {}
+            _ => {
+                // Positional argument = layout name
+                if layout_name.is_none() {
+                    layout_name = Some(arg.to_string());
+                }
+            }
+        }
+    }
+
+    Ok(TmuxCliCommand::SelectLayout {
+        target,
+        layout_name,
+    })
+}
+
+fn parse_break_pane(args: &[String]) -> Result<TmuxCliCommand> {
+    let mut detach = false;
+    let mut source = None;
+    let mut target = None;
+
+    let strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let mut iter = strs.iter().copied();
+    while let Some(arg) = iter.next() {
+        match arg {
+            "-d" => detach = true,
+            "-s" => source = Some(take_flag_value("-s", &mut iter)?),
+            "-t" => target = Some(take_flag_value("-t", &mut iter)?),
+            // Flags we accept but ignore
+            "-P" => {}
+            "-F" => {
+                let _ = take_flag_value("-F", &mut iter)?;
+            }
+            "-n" => {
+                let _ = take_flag_value("-n", &mut iter)?;
+            }
+            other => bail!("break-pane: unexpected argument: {other:?}"),
+        }
+    }
+
+    Ok(TmuxCliCommand::BreakPane {
+        detach,
+        source,
+        target,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1012,6 +1239,7 @@ mod tests {
                 vertical: false,
                 target: None,
                 size: None,
+                print_and_format: None,
             }
         );
     }
@@ -1025,6 +1253,7 @@ mod tests {
                 vertical: true,
                 target: Some("%3".into()),
                 size: None,
+                print_and_format: None,
             }
         );
     }
@@ -1038,6 +1267,7 @@ mod tests {
                 vertical: false,
                 target: None,
                 size: None,
+                print_and_format: None,
             }
         );
     }
@@ -1051,6 +1281,7 @@ mod tests {
                 vertical: false,
                 target: None,
                 size: Some("50%".into()),
+                print_and_format: None,
             }
         );
     }
@@ -1264,6 +1495,7 @@ mod tests {
             TmuxCliCommand::NewWindow {
                 target: None,
                 name: None,
+                print_and_format: None,
             }
         );
     }
@@ -1275,6 +1507,7 @@ mod tests {
             TmuxCliCommand::NewWindow {
                 target: None,
                 name: Some("mywin".into()),
+                print_and_format: None,
             }
         );
     }
@@ -1286,6 +1519,7 @@ mod tests {
             TmuxCliCommand::NewWindow {
                 target: Some("$0".into()),
                 name: Some("editor".into()),
+                print_and_format: None,
             }
         );
     }
@@ -1314,6 +1548,8 @@ mod tests {
             parse("select-pane -t %2"),
             TmuxCliCommand::SelectPane {
                 target: Some("%2".into()),
+                style: None,
+                title: None,
             }
         );
     }
@@ -1497,6 +1733,7 @@ mod tests {
             TmuxCliCommand::DisplayMessage {
                 print: true,
                 format: Some("#{session_id}".into()),
+                target: None,
             }
         );
     }
@@ -1508,6 +1745,7 @@ mod tests {
             TmuxCliCommand::DisplayMessage {
                 print: false,
                 format: None,
+                target: None,
             }
         );
     }
@@ -1519,6 +1757,7 @@ mod tests {
             TmuxCliCommand::DisplayMessage {
                 print: false,
                 format: Some("#{window_id}".into()),
+                target: None,
             }
         );
     }
@@ -1814,6 +2053,9 @@ mod tests {
             parse("new-session -s work"),
             TmuxCliCommand::NewSession {
                 name: Some("work".into()),
+                window_name: None,
+                detached: false,
+                print_and_format: None,
             }
         );
     }
@@ -1822,7 +2064,12 @@ mod tests {
     fn new_session_no_args() {
         assert_eq!(
             parse("new-session"),
-            TmuxCliCommand::NewSession { name: None }
+            TmuxCliCommand::NewSession {
+                name: None,
+                window_name: None,
+                detached: false,
+                print_and_format: None,
+            }
         );
     }
 
@@ -1832,6 +2079,9 @@ mod tests {
             parse("new -s dev"),
             TmuxCliCommand::NewSession {
                 name: Some("dev".into()),
+                window_name: None,
+                detached: false,
+                print_and_format: None,
             }
         );
     }
@@ -2208,6 +2458,235 @@ mod tests {
             TmuxCliCommand::CopyMode {
                 quit: true,
                 target: Some("%3".into()),
+            }
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 13: Claude Code agent teams compatibility
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn split_window_print_format() {
+        assert_eq!(
+            parse("split-window -t %5 -h -l 70% -P -F '#{pane_id}'"),
+            TmuxCliCommand::SplitWindow {
+                horizontal: true,
+                vertical: false,
+                target: Some("%5".into()),
+                size: Some("70%".into()),
+                print_and_format: Some("#{pane_id}".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn split_window_print_default_format() {
+        assert_eq!(
+            parse("split-window -h -P"),
+            TmuxCliCommand::SplitWindow {
+                horizontal: true,
+                vertical: false,
+                target: None,
+                size: None,
+                print_and_format: Some("#{session_name}:#{window_index}.#{pane_index}".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn split_window_ignores_extra_flags() {
+        // Claude Code may send -d, -b, -f, -c, -e flags
+        assert_eq!(
+            parse("split-window -h -d -c /tmp"),
+            TmuxCliCommand::SplitWindow {
+                horizontal: true,
+                vertical: false,
+                target: None,
+                size: None,
+                print_and_format: None,
+            }
+        );
+    }
+
+    #[test]
+    fn new_window_print_format() {
+        assert_eq!(
+            parse("new-window -t main -n editor -P -F '#{pane_id}'"),
+            TmuxCliCommand::NewWindow {
+                target: Some("main".into()),
+                name: Some("editor".into()),
+                print_and_format: Some("#{pane_id}".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn new_session_full_claude_code() {
+        assert_eq!(
+            parse("new-session -d -s myswarm -n main -P -F '#{pane_id}'"),
+            TmuxCliCommand::NewSession {
+                name: Some("myswarm".into()),
+                window_name: Some("main".into()),
+                detached: true,
+                print_and_format: Some("#{pane_id}".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn select_pane_with_style() {
+        assert_eq!(
+            parse("select-pane -t %5 -P bg=default,fg=blue"),
+            TmuxCliCommand::SelectPane {
+                target: Some("%5".into()),
+                style: Some("bg=default,fg=blue".into()),
+                title: None,
+            }
+        );
+    }
+
+    #[test]
+    fn select_pane_with_title() {
+        assert_eq!(
+            parse("select-pane -t %5 -T myagent"),
+            TmuxCliCommand::SelectPane {
+                target: Some("%5".into()),
+                style: None,
+                title: Some("myagent".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn select_pane_ignored_flags() {
+        // -e, -d, -D, -l, -M, -m, -Z, -U, -R, -L should all be accepted
+        assert_eq!(
+            parse("select-pane -t %5 -e -Z"),
+            TmuxCliCommand::SelectPane {
+                target: Some("%5".into()),
+                style: None,
+                title: None,
+            }
+        );
+    }
+
+    #[test]
+    fn display_message_with_target() {
+        assert_eq!(
+            parse("display-message -t %5 -p '#{session_name}:#{window_index}'"),
+            TmuxCliCommand::DisplayMessage {
+                print: true,
+                format: Some("#{session_name}:#{window_index}".into()),
+                target: Some("%5".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn set_option_pane_style() {
+        assert_eq!(
+            parse("set-option -p -t %5 pane-border-style fg=blue"),
+            TmuxCliCommand::SetOption {
+                target: Some("%5".into()),
+                option_name: Some("pane-border-style".into()),
+                value: Some("fg=blue".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn set_option_alias_set() {
+        assert_eq!(
+            parse("set -g status off"),
+            TmuxCliCommand::SetOption {
+                target: None,
+                option_name: Some("status".into()),
+                value: Some("off".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn select_layout_main_vertical() {
+        assert_eq!(
+            parse("select-layout -t @0 main-vertical"),
+            TmuxCliCommand::SelectLayout {
+                target: Some("@0".into()),
+                layout_name: Some("main-vertical".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn select_layout_tiled() {
+        assert_eq!(
+            parse("select-layout tiled"),
+            TmuxCliCommand::SelectLayout {
+                target: None,
+                layout_name: Some("tiled".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn select_layout_alias_selectl() {
+        assert_eq!(
+            parse("selectl -t @0 even-horizontal"),
+            TmuxCliCommand::SelectLayout {
+                target: Some("@0".into()),
+                layout_name: Some("even-horizontal".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn break_pane_claude_code() {
+        assert_eq!(
+            parse("break-pane -d -s %5 -t main:"),
+            TmuxCliCommand::BreakPane {
+                detach: true,
+                source: Some("%5".into()),
+                target: Some("main:".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn break_pane_alias_breakp() {
+        assert_eq!(
+            parse("breakp -d -s %3"),
+            TmuxCliCommand::BreakPane {
+                detach: true,
+                source: Some("%3".into()),
+                target: None,
+            }
+        );
+    }
+
+    #[test]
+    fn resize_pane_percentage() {
+        // Claude Code sends percentage values — they should parse correctly
+        assert_eq!(
+            parse("resize-pane -t %5 -x 30%"),
+            TmuxCliCommand::ResizePane {
+                target: Some("%5".into()),
+                width: Some(30),
+                height: None,
+                zoom: false,
+            }
+        );
+    }
+
+    #[test]
+    fn resize_pane_percentage_y() {
+        assert_eq!(
+            parse("resize-pane -t %5 -y 50%"),
+            TmuxCliCommand::ResizePane {
+                target: Some("%5".into()),
+                width: None,
+                height: Some(50),
+                zoom: false,
             }
         );
     }

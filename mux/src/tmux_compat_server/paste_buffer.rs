@@ -130,7 +130,8 @@ impl PasteBufferStore {
             .collect();
         auto_bufs.sort_by_key(|&(_, order)| order);
         let to_remove = auto_count - BUFFER_LIMIT;
-        let remove_indices: Vec<usize> = auto_bufs.iter().take(to_remove).map(|&(i, _)| i).collect();
+        let remove_indices: Vec<usize> =
+            auto_bufs.iter().take(to_remove).map(|&(i, _)| i).collect();
         // Remove in reverse index order to preserve indices.
         for &idx in remove_indices.iter().rev() {
             self.buffers.remove(idx);
