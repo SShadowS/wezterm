@@ -1,7 +1,7 @@
 # PLAN2.md — Tmux CC Protocol Compatibility Roadmap
 
 **Created**: 2026-02-14
-**Status**: Active development — Phase 11 (clipboard/buffer commands) complete
+**Status**: Active development — Phases 1-11 complete, Phase 12 planned
 
 ---
 
@@ -472,17 +472,121 @@
 
 ## Phase 12: Advanced / Modern tmux (3.2+) Features
 
-**Priority**: LOW — for future compatibility
+**Priority**: MIXED — pause mode is CRITICAL, others vary
 **Status**: [ ] Not started
 
-- [ ] `%pause` / `%continue` — flow control for output
-- [ ] `%extended-output` — output with latency info
-- [ ] `%subscription-changed` — subscription-based notifications
-- [ ] `refresh-client -f pause-after=N,wait-exit` — pause mode flags
-- [ ] `copy-mode` / `copy-mode -q` — enter/exit copy mode
-- [ ] `move-pane` / `move-window` — reorganize layout
-- [ ] `display-menu` / `display-popup` — UI overlays
-- [ ] Persistent ID mapping across reconnects
+### Verification Notes (from tmux + iTerm2 source analysis)
+
+**tmux source** (`control.c`, `control-notify.c`, `cmd-refresh-client.c`):
+- Pause mode introduced in tmux 3.2: `%pause %<pane>`, `%continue %<pane>`, `%extended-output`
+- `control_pause_pane()` sets `CONTROL_PANE_PAUSED` flag, discards buffered data, sends notification
+- `%extended-output` replaces `%output` when `CLIENT_CONTROL_PAUSEAFTER` flag is set — format: `%extended-output %<pane_id> <age_ms> : <vis_data>`
+- Without pause-after, tmux force-disconnects clients >300s behind (`CONTROL_MAXIMUM_AGE`)
+- Subscriptions: `refresh-client -B <name>:<target>:<format>` registers format watch, 1s polling interval, change detection via `last` value
+- `%subscription-changed <name> $<session> @<window> <index> %<pane> : <value>`
+- Additional notifications not in original plan: `%pane-mode-changed`, `%client-session-changed`, `%client-detached`, `%config-error`, `%message`, `%unlinked-window-*`
+
+**iTerm2 usage** (`TmuxGateway.m`, `TmuxController.m`, `iTermTmuxBufferSizeMonitor.m`):
+- **Pause mode**: CRITICAL — `enablePauseModeIfPossible` sends `refresh-client -fpause-after=<N>` on connect (tmux 3.2+)
+- **%extended-output**: CRITICAL — `parseExtendedOutputCommandData:` extracts latency, feeds to `iTermTmuxBufferSizeMonitor` which uses linear regression on latency data points
+- **%pause/%continue**: Handled — `parsePauseCommand:` triggers `tmuxWindowPaneDidPause:`, `%continue` explicitly ignored ("Don't care")
+- **Subscriptions**: Actively used via `iTermTmuxOptionMonitor` with graceful fallback to `display-message` polling for tmux < 3.2
+- **copy-mode -q**: Only used defensively to exit copy mode after tmux.conf errors (not for UI)
+- **move-pane/move-window**: Actively used for layout reorganization
+- **display-menu/display-popup**: Listed in `forbiddenCommands` — intentionally excluded, not CC protocol features
+- **%pane-mode-changed**: Explicitly ignored ("Don't care")
+- **Version gating**: 3.2 (pause mode, subscriptions), 3.6 (OSC queries, clipboard), 2.9 (variable window sizes)
+
+**WezTerm current state**:
+- No pause/resume mechanism for PTY output — `read_from_pane_pty` continuously reads with no throttle
+- Full copy mode overlay exists (`wezterm-gui/src/overlay/copy.rs` ~2000 lines) — just needs tmux command bridge
+- `move_pane_to_new_tab()` exists but no between-tab pane movement
+- `Mux::subscribe()` callback system exists for notifications but no option-change events
+- IdMap is pure in-memory HashMap, no serialization
+
+### 12.1 — Pause Mode & Flow Control (CRITICAL)
+
+**Priority**: CRITICAL — prevents unbounded memory growth, required by iTerm2
+**Status**: [x] Complete
+
+iTerm2 sends `refresh-client -fpause-after=<N>` immediately after connecting to tmux 3.2+. The pause-after flag enables `%extended-output` (with latency) instead of `%output`. When a pane's buffered output exceeds N seconds of age, tmux pauses the pane and sends `%pause %<pane_id>`. The client resumes with `refresh-client -A %<pane>:continue`.
+
+- [x] Add `pause_age_ms: Option<u64>`, `wait_exit: bool`, `paused_panes`, `pane_output_timestamps` to `HandlerContext`
+- [x] Parse `refresh-client -f pause-after=N,wait-exit` and `refresh-client -f !pause-after`
+- [x] Track per-pane pause state and output age in `HandlerContext`
+- [x] When `pause_age` is set, emit `%extended-output %<pane_id> <age_ms> : <vis_data>` instead of `%output`
+- [x] When age exceeds `pause_age`, set pane paused flag, emit `%pause %<pane_id>`, stop forwarding output
+- [x] Parse `refresh-client -A %<pane>:continue` / `refresh-client -A %<pane>:pause` / `refresh-client -A %<pane>:on` / `refresh-client -A %<pane>:off`
+- [x] Add `pause_notification()`, `continue_notification()`, `extended_output_notification()` to `response.rs`
+- [x] Add raw output tap infrastructure in `mux/src/lib.rs` (`register_output_tap`, `notify_output_taps`)
+- [x] Wire `%output`/`%extended-output` forwarding in CC connection loop via output tap receivers
+- **Files**: `mux/src/lib.rs`, `handlers.rs`, `server.rs`, `response.rs`, `command_parser.rs`
+- **Difficulty**: Medium-High (core output pipeline changes, per-pane timing state)
+
+### 12.2 — Subscription Notifications (HIGH)
+
+**Priority**: HIGH — iTerm2 actively uses for efficient format monitoring
+**Status**: [ ] Not started
+
+Subscriptions eliminate polling overhead. iTerm2's `iTermTmuxOptionMonitor` uses subscriptions when available (tmux 3.2+), falls back to periodic `display-message` calls otherwise.
+
+- [ ] Add `Subscription { name, target, format, last_value }` struct
+- [ ] Add `subscriptions: Vec<Subscription>` to `HandlerContext`
+- [ ] Parse `refresh-client -B <name>:<target>:<format>` to register subscriptions
+- [ ] Parse `refresh-client -B ""` or `-B <name>:` to unsubscribe
+- [ ] Add periodic check (1s interval) that evaluates each subscription's format string
+- [ ] Only emit notification when value changes (compare with `last_value`)
+- [ ] Wire format: `%subscription-changed <name> $<session_id> @<window_id> <window_index> %<pane_id> : <value>`
+- [ ] Target types: `$<session>`, `@<window>`, `%<pane>`, `%*` (all panes), `@*` (all windows)
+- [ ] Add `subscription_changed_notification()` to `response.rs`
+- **Files**: `handlers.rs`, `server.rs`, `response.rs`, `command_parser.rs`
+- **Difficulty**: Medium (timer integration, format evaluation per subscription)
+
+### 12.3 — Move Commands (MEDIUM)
+
+**Priority**: MEDIUM — iTerm2 actively uses both for layout reorganization
+**Status**: [ ] Not started
+
+- [ ] Add `MovePane { src: String, dst: String, horizontal: bool, before: bool }` to `TmuxCliCommand`
+- [ ] Parse `move-pane -s <src> -t <dst> [-h|-v] [-b]` (alias: `movep`)
+- [ ] Handler: remove pane from source tab, insert into destination tab's split tree
+- [ ] Add `MoveWindow { src: String, dst: String }` to `TmuxCliCommand`
+- [ ] Parse `move-window -s <src> -t <dst>` (alias: `movew`)
+- [ ] Handler: unlink tab from source window, link into destination window
+- [ ] Emit `%layout-change` for affected windows
+- **Files**: `command_parser.rs`, `handlers.rs`
+- **Difficulty**: Medium (pane movement within split trees, tab reparenting)
+- **Note**: `move_pane_to_new_tab()` exists in `mux/src/lib.rs` — extend for between-tab movement
+
+### 12.4 — Copy Mode Bridge (LOW)
+
+**Priority**: LOW — iTerm2 only uses `copy-mode -q` defensively
+**Status**: [ ] Not started
+
+- [ ] Add `CopyMode { quit: bool, target: Option<String> }` to `TmuxCliCommand`
+- [ ] Parse `copy-mode [-q] [-t target]`
+- [ ] Handler for `-q`: reset pane modes (defensive, matches tmux behavior for config errors)
+- [ ] Handler without `-q`: optional — could bridge to WezTerm's copy overlay
+- **Files**: `command_parser.rs`, `handlers.rs`
+- **Difficulty**: Low (just `-q` flag), Medium (full copy mode bridge to GUI overlay)
+
+### 12.5 — Persistent ID Mapping (MEDIUM)
+
+**Priority**: MEDIUM — enables session recovery across reconnects
+**Status**: [ ] Not started
+
+- [ ] Add `serde::Serialize`/`Deserialize` derives to IdMap
+- [ ] Save IdMap to `~/.cache/wezterm/tmux-id-map-<workspace>.json` on each update
+- [ ] Load on server startup, restore previous mappings
+- [ ] Handle ID collision detection (new panes may reuse old numeric IDs)
+- [ ] Strategy: key by (workspace, pane_title, position) for semantic identity
+- **Files**: `id_map.rs`, `server.rs`
+- **Difficulty**: Medium (serialization is easy; collision handling and semantic identity are harder)
+
+### DROPPED from Phase 12
+
+- ~~`display-menu` / `display-popup`~~ — GUI overlay commands, not CC protocol features. iTerm2 lists both in `forbiddenCommands`. No CC client uses them.
+- ~~`%pane-mode-changed`~~ — iTerm2 explicitly ignores this notification ("Don't care")
 
 ---
 

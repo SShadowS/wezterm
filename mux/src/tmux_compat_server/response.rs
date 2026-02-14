@@ -120,6 +120,33 @@ pub fn output_notification(pane_id: u64, data: &[u8]) -> String {
     format!("%output %{} {}\n", pane_id, vis_encode(data))
 }
 
+/// `%extended-output %<pane_id> <age_ms> : <vis_encoded_data>`
+///
+/// Sent instead of `%output` when pause mode is enabled (`pause-after` flag).
+/// The `age_ms` field tells the client how long this data has been buffered.
+pub fn extended_output_notification(pane_id: u64, age_ms: u64, data: &[u8]) -> String {
+    format!(
+        "%extended-output %{} {} : {}\n",
+        pane_id,
+        age_ms,
+        vis_encode(data)
+    )
+}
+
+/// `%pause %<pane_id>`
+///
+/// Sent when a pane's buffered output exceeds the `pause-after` age limit.
+pub fn pause_notification(pane_id: u64) -> String {
+    format!("%pause %{}\n", pane_id)
+}
+
+/// `%continue %<pane_id>`
+///
+/// Sent when a previously paused pane is resumed.
+pub fn continue_notification(pane_id: u64) -> String {
+    format!("%continue %{}\n", pane_id)
+}
+
 /// `%layout-change @<window_id> <layout_string>`
 pub fn layout_change_notification(window_id: u64, layout: &str) -> String {
     format!("%layout-change @{} {}\n", window_id, layout)
@@ -509,5 +536,33 @@ mod tests {
             session_window_changed_notification(3, 15),
             "%session-window-changed $3 @15\n"
         );
+    }
+
+    // -- Phase 12.1: pause mode notifications ---
+
+    #[test]
+    fn extended_output_notification_basic() {
+        assert_eq!(
+            extended_output_notification(1, 500, b"hello\r\n"),
+            "%extended-output %1 500 : hello\\015\\012\n"
+        );
+    }
+
+    #[test]
+    fn extended_output_notification_zero_age() {
+        assert_eq!(
+            extended_output_notification(0, 0, b"test"),
+            "%extended-output %0 0 : test\n"
+        );
+    }
+
+    #[test]
+    fn pause_notification_basic() {
+        assert_eq!(pause_notification(3), "%pause %3\n");
+    }
+
+    #[test]
+    fn continue_notification_basic() {
+        assert_eq!(continue_notification(3), "%continue %3\n");
     }
 }

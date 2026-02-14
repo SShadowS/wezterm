@@ -6,6 +6,7 @@
 //! CC-style `%`-prefixed notification lines.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::tab::{PositionedPane, Tab};
 use crate::{Mux, MuxNotification};
@@ -14,11 +15,12 @@ use super::command_parser::parse_command;
 use super::handlers::{dispatch_command, HandlerContext};
 use super::layout::{generate_layout_string, LayoutNode};
 use super::response::{
-    exit_notification, layout_change_notification, paste_buffer_changed_notification,
+    exit_notification, extended_output_notification, layout_change_notification,
+    output_notification, paste_buffer_changed_notification, pause_notification,
     session_changed_notification, session_renamed_notification,
-    session_window_changed_notification, sessions_changed_notification,
-    window_add_notification, window_close_notification, window_pane_changed_notification,
-    window_renamed_notification, ResponseWriter,
+    session_window_changed_notification, sessions_changed_notification, window_add_notification,
+    window_close_notification, window_pane_changed_notification, window_renamed_notification,
+    ResponseWriter,
 };
 
 
@@ -425,6 +427,98 @@ pub fn extract_lines(buf: &mut String) -> Vec<String> {
 /// Monotonic counter for generating unique client names.
 static CLIENT_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Drain pending output from output tap receivers and write `%output` or
+/// `%extended-output` notifications to the stream.
+///
+/// Returns `Err` if a write fails (connection broken).
+fn drain_output_taps(
+    session: &mut TmuxCompatSession,
+    output_rx: &std::sync::mpsc::Receiver<(crate::pane::PaneId, Vec<u8>, Instant)>,
+    stream: &mut impl std::io::Write,
+) -> anyhow::Result<()> {
+    while let Ok((wezterm_pane_id, data, when)) = output_rx.try_recv() {
+        // Map WezTerm pane ID to tmux pane ID.
+        let tmux_pid = match session.ctx.id_map.tmux_pane_id(wezterm_pane_id) {
+            Some(id) => id,
+            None => continue, // Not a tracked pane.
+        };
+
+        // Skip if this pane is paused.
+        if session.ctx.paused_panes.get(&tmux_pid) == Some(&true) {
+            continue;
+        }
+
+        // Format as %output or %extended-output.
+        let notif = if session.ctx.pause_age_ms.is_some() {
+            // Pause mode enabled — compute age and use %extended-output.
+            let age_ms = {
+                let first_ts = session
+                    .ctx
+                    .pane_output_timestamps
+                    .entry(tmux_pid)
+                    .or_insert(when);
+                when.saturating_duration_since(*first_ts).as_millis() as u64
+            };
+
+            // Check if age exceeds pause threshold → auto-pause.
+            if let Some(limit_ms) = session.ctx.pause_age_ms {
+                if limit_ms > 0 && age_ms > limit_ms {
+                    session.ctx.paused_panes.insert(tmux_pid, true);
+                    let pause = pause_notification(tmux_pid);
+                    std::io::Write::write_all(stream, pause.as_bytes())?;
+                    continue;
+                }
+            }
+
+            extended_output_notification(tmux_pid, age_ms, &data)
+        } else {
+            output_notification(tmux_pid, &data)
+        };
+
+        std::io::Write::write_all(stream, notif.as_bytes())?;
+    }
+    std::io::Write::flush(stream)?;
+    Ok(())
+}
+
+/// Register output taps for all panes in the workspace and start a forwarder
+/// thread that reads raw output from taps and sends it to a unified channel.
+///
+/// Returns a receiver for `(wezterm_pane_id, data, timestamp)`.
+fn start_output_forwarder(
+    workspace: &str,
+) -> std::sync::mpsc::Receiver<(crate::pane::PaneId, Vec<u8>, Instant)> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(1024);
+
+    // Register taps for all existing panes.
+    if let Some(mux) = Mux::try_get() {
+        let window_ids = mux.iter_windows_in_workspace(workspace);
+        for wid in window_ids {
+            if let Some(win) = mux.get_window(wid) {
+                for tab in win.iter() {
+                    for pp in tab.iter_panes() {
+                        let pane_id = pp.pane.pane_id();
+                        let tap_rx = crate::register_output_tap(pane_id);
+                        let tx2 = tx.clone();
+                        std::thread::Builder::new()
+                            .name(format!("cc-output-tap-{}", pane_id))
+                            .spawn(move || {
+                                for (data, when) in tap_rx {
+                                    if tx2.send((pane_id, data, when)).is_err() {
+                                        break; // Connection closed.
+                                    }
+                                }
+                            })
+                            .ok();
+                    }
+                }
+            }
+        }
+    }
+
+    rx
+}
+
 fn process_cc_connection_sync(
     mut stream: impl std::io::Read + std::io::Write,
     listen_addr: &str,
@@ -434,7 +528,7 @@ fn process_cc_connection_sync(
     let workspace = Mux::try_get()
         .map(|mux| mux.active_workspace().to_string())
         .unwrap_or_else(|| "default".to_string());
-    let mut session = TmuxCompatSession::new(workspace);
+    let mut session = TmuxCompatSession::new(workspace.clone());
     let client_num = CLIENT_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     session.ctx.client_name = format!("/dev/pts/{}", client_num);
     session.ctx.socket_path = listen_addr.to_string();
@@ -444,12 +538,18 @@ fn process_cc_connection_sync(
     std::io::Write::flush(&mut stream)?;
     log::info!("tmux CC: handshake sent ({} bytes)", handshake.len());
 
+    // Start output forwarder for all panes in the workspace.
+    let output_rx = start_output_forwarder(&workspace);
+
     // Manual line-buffered read loop.  We avoid BufReader because we need
     // to alternate reads and writes on the same stream, and writes through
     // BufReader::get_mut() don't work reliably on Windows.
     let mut read_buf = vec![0u8; 4096];
     let mut accum = String::new();
     loop {
+        // Drain any pending output before blocking on read.
+        drain_output_taps(&mut session, &output_rx, &mut stream)?;
+
         // Extract any complete line already in the accumulator.
         let line = loop {
             if let Some(pos) = accum.find('\n') {
@@ -457,13 +557,17 @@ fn process_cc_connection_sync(
                 accum.drain(..=pos);
                 break line;
             }
-            // Need more data.
+            // Need more data — read with a short timeout so we can also
+            // drain output taps periodically.
             let n = std::io::Read::read(&mut stream, &mut read_buf)?;
             if n == 0 {
                 log::trace!("CC client disconnected (EOF)");
                 return Ok(());
             }
             accum.push_str(&String::from_utf8_lossy(&read_buf[..n]));
+
+            // Also drain output between reads.
+            drain_output_taps(&mut session, &output_rx, &mut stream)?;
         };
 
         let trimmed = line.trim().to_string();
@@ -491,9 +595,18 @@ fn process_cc_connection_sync(
         })
         .detach();
 
-        let (response, ctx_back) = resp_rx
-            .recv()
-            .map_err(|_| anyhow::anyhow!("failed to receive command response"))?;
+        // While waiting for the command response, keep draining output.
+        let (response, ctx_back) = loop {
+            match resp_rx.recv_timeout(std::time::Duration::from_millis(10)) {
+                Ok(result) => break result,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    drain_output_taps(&mut session, &output_rx, &mut stream)?;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(anyhow::anyhow!("failed to receive command response"));
+                }
+            }
+        };
         session.ctx = ctx_back;
 
         let formatted = match response {
@@ -511,6 +624,9 @@ fn process_cc_connection_sync(
             std::io::Write::write_all(&mut stream, notif.as_bytes())?;
         }
         std::io::Write::flush(&mut stream)?;
+
+        // Drain output after command response too.
+        drain_output_taps(&mut session, &output_rx, &mut stream)?;
 
         // If detach was requested, send %exit and close the connection.
         if session.ctx.detach_requested {

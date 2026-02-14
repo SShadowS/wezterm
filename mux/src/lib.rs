@@ -100,6 +100,54 @@ pub enum MuxNotification {
 
 static SUB_ID: AtomicUsize = AtomicUsize::new(0);
 
+// ---------------------------------------------------------------------------
+// Raw output tap — allows CC protocol connections to receive raw PTY bytes
+// ---------------------------------------------------------------------------
+
+/// Registry of raw output taps keyed by pane ID.
+///
+/// Each entry is a list of senders; when a pane produces output in
+/// `parse_buffered_data`, the raw bytes (plus timestamp) are cloned to each
+/// registered sender.  Senders that fail (disconnected) are automatically
+/// pruned.
+static OUTPUT_TAPS: Mutex<Option<HashMap<PaneId, Vec<std::sync::mpsc::SyncSender<(Vec<u8>, Instant)>>>>>
+    = Mutex::new(None);
+
+/// Register an output tap for a specific pane.
+///
+/// Returns a receiver that will get `(raw_bytes, timestamp)` for every chunk
+/// of PTY output.
+pub fn register_output_tap(pane_id: PaneId) -> std::sync::mpsc::Receiver<(Vec<u8>, Instant)> {
+    let (tx, rx) = std::sync::mpsc::sync_channel(256);
+    let mut guard = OUTPUT_TAPS.lock();
+    let map = guard.get_or_insert_with(HashMap::new);
+    map.entry(pane_id).or_default().push(tx);
+    rx
+}
+
+/// Remove all output taps for a given pane (e.g. when pane is removed).
+pub fn remove_output_taps(pane_id: PaneId) {
+    let mut guard = OUTPUT_TAPS.lock();
+    if let Some(map) = guard.as_mut() {
+        map.remove(&pane_id);
+    }
+}
+
+/// Send raw bytes to all taps registered for `pane_id`.
+///
+/// Disconnected senders are pruned automatically.
+fn notify_output_taps(pane_id: PaneId, data: &[u8], when: Instant) {
+    let mut guard = OUTPUT_TAPS.lock();
+    if let Some(map) = guard.as_mut() {
+        if let Some(senders) = map.get_mut(&pane_id) {
+            senders.retain(|tx| tx.try_send((data.to_vec(), when)).is_ok());
+            if senders.is_empty() {
+                map.remove(&pane_id);
+            }
+        }
+    }
+}
+
 pub struct Mux {
     tabs: RwLock<HashMap<TabId, Arc<Tab>>>,
     panes: RwLock<HashMap<PaneId, Arc<dyn Pane>>>,
@@ -158,6 +206,11 @@ fn parse_buffered_data(pane: Weak<dyn Pane>, dead: &Arc<AtomicBool>, mut rx: Fil
                 break;
             }
             Ok(size) => {
+                // Notify any registered output taps (CC protocol connections).
+                if let Some(pane_ref) = pane.upgrade() {
+                    notify_output_taps(pane_ref.pane_id(), &buf[0..size], Instant::now());
+                }
+
                 parser.parse(&buf[0..size], |action| {
                     let mut flush = false;
                     match &action {

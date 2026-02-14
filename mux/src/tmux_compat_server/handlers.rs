@@ -54,6 +54,17 @@ pub struct HandlerContext {
     pub socket_path: String,
     /// In-process paste buffer store for clipboard/buffer commands.
     pub paste_buffers: PasteBufferStore,
+    /// Pause-after age in milliseconds. When set, `%extended-output` is sent
+    /// instead of `%output`, and panes are paused when buffered output exceeds
+    /// this age. `None` means pause mode is disabled.
+    pub pause_age_ms: Option<u64>,
+    /// Whether `wait-exit` flag is set (wait for empty line before exiting).
+    pub wait_exit: bool,
+    /// Per-pane pause state. Maps tmux pane ID → paused flag.
+    pub paused_panes: HashMap<u64, bool>,
+    /// Per-pane output timestamp tracking. Maps tmux pane ID → Instant of
+    /// first unbuffered byte (for age calculation).
+    pub pane_output_timestamps: HashMap<u64, std::time::Instant>,
 }
 
 impl HandlerContext {
@@ -71,6 +82,10 @@ impl HandlerContext {
             client_name: String::new(),
             socket_path: String::new(),
             paste_buffers: PasteBufferStore::new(),
+            pause_age_ms: None,
+            wait_exit: false,
+            paused_panes: HashMap::new(),
+            pane_output_timestamps: HashMap::new(),
         }
     }
 }
@@ -476,9 +491,11 @@ pub async fn dispatch_command(
             width,
             height,
         } => handle_resize_window(ctx, &target, width, height),
-        TmuxCliCommand::RefreshClient { size, flags: _ } => {
-            handle_refresh_client(ctx, size.as_deref())
-        }
+        TmuxCliCommand::RefreshClient {
+            size,
+            flags,
+            adjust_pane,
+        } => handle_refresh_client(ctx, size.as_deref(), flags.as_deref(), adjust_pane.as_deref()),
         TmuxCliCommand::SplitWindow {
             horizontal,
             vertical: _,
@@ -1085,14 +1102,48 @@ pub fn handle_resize_window(
     Ok(String::new())
 }
 
-/// Refresh client — parse `WxH` from size and resize all tabs in workspace.
+/// Refresh client — handle `-C WxH`, `-f flags`, and `-A pane:action`.
 pub fn handle_refresh_client(
     ctx: &mut HandlerContext,
     size: Option<&str>,
+    flags: Option<&str>,
+    adjust_pane: Option<&str>,
 ) -> Result<String, String> {
-    let mux = Mux::try_get().ok_or_else(|| "mux not available".to_string())?;
+    // Handle -f flags first (doesn't need Mux).
+    // Handle -f flags (comma-separated: pause-after=N, wait-exit, !pause-after, etc.)
+    if let Some(flags_str) = flags {
+        for flag in flags_str.split(',') {
+            let flag = flag.trim();
+            if flag.is_empty() {
+                continue;
+            }
+            if flag == "wait-exit" {
+                ctx.wait_exit = true;
+            } else if flag == "!wait-exit" {
+                ctx.wait_exit = false;
+            } else if flag == "pause-after" {
+                // bare "pause-after" with no value means pause-after=0 (immediate)
+                ctx.pause_age_ms = Some(0);
+            } else if flag == "!pause-after" {
+                ctx.pause_age_ms = None;
+            } else if let Some(val) = flag.strip_prefix("pause-after=") {
+                let seconds: u64 = val
+                    .parse()
+                    .map_err(|_| format!("invalid pause-after value: {}", val))?;
+                ctx.pause_age_ms = Some(seconds * 1000);
+            }
+            // Unknown flags are silently ignored (matches tmux behavior).
+        }
+    }
 
+    // Handle -A %<pane>:<action> (adjust pane output mode).
+    if let Some(adjust) = adjust_pane {
+        parse_and_apply_pane_adjust(ctx, adjust)?;
+    }
+
+    // Handle -C WxH (resize all tabs) — requires Mux.
     if let Some(size_str) = size {
+        let mux = Mux::try_get().ok_or_else(|| "mux not available".to_string())?;
         let parts: Vec<&str> = size_str.split(',').collect();
         if let Some(dim_str) = parts.first() {
             let dims: Vec<&str> = dim_str.split('x').collect();
@@ -1129,6 +1180,61 @@ pub fn handle_refresh_client(
     }
 
     Ok(String::new())
+}
+
+/// Parse `-A %<pane>:<action>` and apply the action.
+///
+/// Actions: `on`, `off`, `continue`, `pause`
+fn parse_and_apply_pane_adjust(
+    ctx: &mut HandlerContext,
+    spec: &str,
+) -> Result<(), String> {
+    // Format: "%<pane_id>:<action>" or just "%<pane_id>" (defaults to "on")
+    let (pane_part, action) = match spec.find(':') {
+        Some(pos) => (&spec[..pos], &spec[pos + 1..]),
+        None => (spec, "on"),
+    };
+
+    // Parse %<pane_id>
+    let tmux_pane_id = if let Some(id_str) = pane_part.strip_prefix('%') {
+        id_str
+            .parse::<u64>()
+            .map_err(|_| format!("invalid pane id: {}", pane_part))?
+    } else {
+        return Err(format!("expected %%<pane_id>, got: {}", pane_part));
+    };
+
+    match action {
+        "continue" => {
+            if ctx.paused_panes.get(&tmux_pane_id) == Some(&true) {
+                ctx.paused_panes.insert(tmux_pane_id, false);
+                // Reset the output timestamp so age starts fresh.
+                ctx.pane_output_timestamps.remove(&tmux_pane_id);
+                ctx.pending_notifications.push(
+                    super::response::continue_notification(tmux_pane_id),
+                );
+            }
+        }
+        "pause" => {
+            ctx.paused_panes.insert(tmux_pane_id, true);
+            ctx.pending_notifications
+                .push(super::response::pause_notification(tmux_pane_id));
+        }
+        "on" => {
+            // Enable output for this pane (unpause without notification).
+            ctx.paused_panes.insert(tmux_pane_id, false);
+            ctx.pane_output_timestamps.remove(&tmux_pane_id);
+        }
+        "off" => {
+            // Disable output for this pane (pause without notification).
+            ctx.paused_panes.insert(tmux_pane_id, true);
+        }
+        other => {
+            return Err(format!("unknown pane adjust action: {}", other));
+        }
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2112,5 +2218,116 @@ mod tests {
         let ctx = HandlerContext::new("test".to_string());
         assert!(ctx.pending_notifications.is_empty());
         assert!(!ctx.detach_requested);
+        assert!(ctx.pause_age_ms.is_none());
+        assert!(!ctx.wait_exit);
+        assert!(ctx.paused_panes.is_empty());
+        assert!(ctx.pane_output_timestamps.is_empty());
+    }
+
+    // --- Phase 12.1: pause mode handler tests ---
+
+    #[test]
+    fn refresh_client_pause_after_sets_age() {
+        let mut ctx = HandlerContext::new("default".to_string());
+        let result = handle_refresh_client(&mut ctx, None, Some("pause-after=5"), None);
+        assert!(result.is_ok());
+        assert_eq!(ctx.pause_age_ms, Some(5000));
+    }
+
+    #[test]
+    fn refresh_client_pause_after_zero() {
+        let mut ctx = HandlerContext::new("default".to_string());
+        let result = handle_refresh_client(&mut ctx, None, Some("pause-after"), None);
+        assert!(result.is_ok());
+        assert_eq!(ctx.pause_age_ms, Some(0));
+    }
+
+    #[test]
+    fn refresh_client_disable_pause() {
+        let mut ctx = HandlerContext::new("default".to_string());
+        ctx.pause_age_ms = Some(5000);
+        let result = handle_refresh_client(&mut ctx, None, Some("!pause-after"), None);
+        assert!(result.is_ok());
+        assert_eq!(ctx.pause_age_ms, None);
+    }
+
+    #[test]
+    fn refresh_client_wait_exit_flag() {
+        let mut ctx = HandlerContext::new("default".to_string());
+        let result = handle_refresh_client(
+            &mut ctx,
+            None,
+            Some("pause-after=3,wait-exit"),
+            None,
+        );
+        assert!(result.is_ok());
+        assert_eq!(ctx.pause_age_ms, Some(3000));
+        assert!(ctx.wait_exit);
+    }
+
+    #[test]
+    fn refresh_client_disable_wait_exit() {
+        let mut ctx = HandlerContext::new("default".to_string());
+        ctx.wait_exit = true;
+        let result = handle_refresh_client(&mut ctx, None, Some("!wait-exit"), None);
+        assert!(result.is_ok());
+        assert!(!ctx.wait_exit);
+    }
+
+    #[test]
+    fn pane_adjust_continue() {
+        let mut ctx = HandlerContext::new("default".to_string());
+        ctx.paused_panes.insert(0, true);
+        let result = handle_refresh_client(&mut ctx, None, None, Some("%0:continue"));
+        assert!(result.is_ok());
+        assert_eq!(ctx.paused_panes.get(&0), Some(&false));
+        assert!(ctx.pending_notifications.iter().any(|n| n.contains("%continue %0")));
+    }
+
+    #[test]
+    fn pane_adjust_pause() {
+        let mut ctx = HandlerContext::new("default".to_string());
+        let result = handle_refresh_client(&mut ctx, None, None, Some("%0:pause"));
+        assert!(result.is_ok());
+        assert_eq!(ctx.paused_panes.get(&0), Some(&true));
+        assert!(ctx.pending_notifications.iter().any(|n| n.contains("%pause %0")));
+    }
+
+    #[test]
+    fn pane_adjust_on_off() {
+        let mut ctx = HandlerContext::new("default".to_string());
+        let result = handle_refresh_client(&mut ctx, None, None, Some("%5:off"));
+        assert!(result.is_ok());
+        assert_eq!(ctx.paused_panes.get(&5), Some(&true));
+        // "off" is silent — no notification.
+        assert!(ctx.pending_notifications.is_empty());
+
+        let result = handle_refresh_client(&mut ctx, None, None, Some("%5:on"));
+        assert!(result.is_ok());
+        assert_eq!(ctx.paused_panes.get(&5), Some(&false));
+        assert!(ctx.pending_notifications.is_empty());
+    }
+
+    #[test]
+    fn pane_adjust_invalid_format() {
+        let mut ctx = HandlerContext::new("default".to_string());
+        let result = handle_refresh_client(&mut ctx, None, None, Some("bad:continue"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn pane_adjust_unknown_action() {
+        let mut ctx = HandlerContext::new("default".to_string());
+        let result = handle_refresh_client(&mut ctx, None, None, Some("%0:unknown"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn pane_adjust_continue_not_paused() {
+        let mut ctx = HandlerContext::new("default".to_string());
+        // Continue on a pane that isn't paused — should be a no-op.
+        let result = handle_refresh_client(&mut ctx, None, None, Some("%0:continue"));
+        assert!(result.is_ok());
+        assert!(ctx.pending_notifications.is_empty());
     }
 }

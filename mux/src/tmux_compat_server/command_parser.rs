@@ -70,6 +70,7 @@ pub enum TmuxCliCommand {
     RefreshClient {
         size: Option<String>,
         flags: Option<String>,
+        adjust_pane: Option<String>,
     },
     DisplayMessage {
         print: bool,
@@ -511,6 +512,7 @@ fn parse_resize_window(args: &[String]) -> Result<TmuxCliCommand> {
 fn parse_refresh_client(args: &[String]) -> Result<TmuxCliCommand> {
     let mut size = None;
     let mut flags = None;
+    let mut adjust_pane = None;
 
     let strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     let mut iter = strs.iter().copied();
@@ -518,11 +520,16 @@ fn parse_refresh_client(args: &[String]) -> Result<TmuxCliCommand> {
         match arg {
             "-C" => size = Some(take_flag_value("-C", &mut iter)?),
             "-f" => flags = Some(take_flag_value("-f", &mut iter)?),
+            "-A" => adjust_pane = Some(take_flag_value("-A", &mut iter)?),
             other => bail!("refresh-client: unexpected argument: {other:?}"),
         }
     }
 
-    Ok(TmuxCliCommand::RefreshClient { size, flags })
+    Ok(TmuxCliCommand::RefreshClient {
+        size,
+        flags,
+        adjust_pane,
+    })
 }
 
 fn parse_display_message(args: &[String]) -> Result<TmuxCliCommand> {
@@ -1291,6 +1298,7 @@ mod tests {
             TmuxCliCommand::RefreshClient {
                 size: Some("160x40".into()),
                 flags: None,
+                adjust_pane: None,
             }
         );
     }
@@ -1302,6 +1310,7 @@ mod tests {
             TmuxCliCommand::RefreshClient {
                 size: None,
                 flags: Some("no-output".into()),
+                adjust_pane: None,
             }
         );
     }
@@ -1313,6 +1322,43 @@ mod tests {
             TmuxCliCommand::RefreshClient {
                 size: Some("80x24".into()),
                 flags: Some("no-output".into()),
+                adjust_pane: None,
+            }
+        );
+    }
+
+    #[test]
+    fn refresh_client_pause_after_flag() {
+        assert_eq!(
+            parse("refresh-client -f pause-after=5,wait-exit"),
+            TmuxCliCommand::RefreshClient {
+                size: None,
+                flags: Some("pause-after=5,wait-exit".into()),
+                adjust_pane: None,
+            }
+        );
+    }
+
+    #[test]
+    fn refresh_client_adjust_pane() {
+        assert_eq!(
+            parse("refresh-client -A %0:continue"),
+            TmuxCliCommand::RefreshClient {
+                size: None,
+                flags: None,
+                adjust_pane: Some("%0:continue".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn refresh_client_disable_pause() {
+        assert_eq!(
+            parse("refresh-client -f !pause-after"),
+            TmuxCliCommand::RefreshClient {
+                size: None,
+                flags: Some("!pause-after".into()),
+                adjust_pane: None,
             }
         );
     }
