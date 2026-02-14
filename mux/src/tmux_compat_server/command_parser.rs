@@ -151,6 +151,11 @@ pub enum TmuxCliCommand {
         src: Option<String>,
         dst: Option<String>,
     },
+    // Phase 12.4: copy mode bridge
+    CopyMode {
+        quit: bool,
+        target: Option<String>,
+    },
 }
 
 /// Parse a tmux command line into a structured [`TmuxCliCommand`].
@@ -208,6 +213,7 @@ pub fn parse_command(line: &str) -> Result<TmuxCliCommand> {
         "paste-buffer" | "pasteb" => parse_paste_buffer(args),
         "move-pane" | "movep" | "join-pane" | "joinp" => parse_move_pane(args),
         "move-window" | "movew" => parse_move_window(args),
+        "copy-mode" => parse_copy_mode(args),
         other => bail!("unknown tmux command: {other:?}"),
     }
 }
@@ -964,6 +970,24 @@ fn parse_move_window(args: &[String]) -> Result<TmuxCliCommand> {
     }
 
     Ok(TmuxCliCommand::MoveWindow { src, dst })
+}
+
+fn parse_copy_mode(args: &[String]) -> Result<TmuxCliCommand> {
+    let mut quit = false;
+    let mut target = None;
+
+    let strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let mut iter = strs.iter().copied();
+    while let Some(arg) = iter.next() {
+        match arg {
+            "-q" => quit = true,
+            "-t" => target = Some(take_flag_value("-t", &mut iter)?),
+            "-e" | "-H" | "-M" | "-u" => {} // accept but ignore
+            other => bail!("copy-mode: unexpected argument: {other:?}"),
+        }
+    }
+
+    Ok(TmuxCliCommand::CopyMode { quit, target })
 }
 
 #[cfg(test)]
@@ -2147,6 +2171,43 @@ mod tests {
             TmuxCliCommand::MoveWindow {
                 src: Some("@0".into()),
                 dst: Some("$1:+".into()),
+            }
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // copy-mode
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn copy_mode_quit() {
+        assert_eq!(
+            parse("copy-mode -q"),
+            TmuxCliCommand::CopyMode {
+                quit: true,
+                target: None,
+            }
+        );
+    }
+
+    #[test]
+    fn copy_mode_with_target() {
+        assert_eq!(
+            parse("copy-mode -t %0"),
+            TmuxCliCommand::CopyMode {
+                quit: false,
+                target: Some("%0".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn copy_mode_quit_with_target() {
+        assert_eq!(
+            parse("copy-mode -q -t %3"),
+            TmuxCliCommand::CopyMode {
+                quit: true,
+                target: Some("%3".into()),
             }
         );
     }

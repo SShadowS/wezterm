@@ -1,7 +1,7 @@
 # PLAN2.md — Tmux CC Protocol Compatibility Roadmap
 
 **Created**: 2026-02-14
-**Status**: Active development — Phases 1-12.3 complete, Phase 12.4-12.5 remaining
+**Status**: Active development — Phases 1-12.4 complete, Phase 12.5 remaining
 
 ---
 
@@ -14,7 +14,7 @@
 - **Config option** `enable_tmux_compat = true` in `.wezterm.lua`
 - **Environment variables** `TMUX`, `WEZTERM_TMUX_CC`, `PATH` set in spawned panes
 - **Manual line-buffered I/O** on both server and shim (BufReader breaks Windows sockets)
-- **35 commands** implemented and working (16 Phase 1-5 + 7 Phase 7 + 4 Phase 8 + 5 Phase 11 + 3 Phase 12.3)
+- **36 commands** implemented and working (16 Phase 1-5 + 7 Phase 7 + 4 Phase 8 + 5 Phase 11 + 3 Phase 12.3 + 1 Phase 12.4)
 - **10 notifications** emitted (+ Phase 6 lifecycle + Phase 9 `%session-window-changed`, `%paste-buffer-changed` + Phase 11 `%paste-buffer-deleted`)
 - **36 format variables** supported with conditional syntax `#{?cond,true,false}` (20 Phase 1-5 + 13 Phase 10 + 3 Phase 11)
 
@@ -57,6 +57,7 @@
 | `move-pane` | `-s`, `-t`, `-h`, `-v`, `-b` | Move pane between split trees (Phase 12.3) |
 | `join-pane` | `-s`, `-t`, `-h`, `-v`, `-b` | Alias for move-pane (Phase 12.3) |
 | `move-window` | `-s`, `-t` | Move tab between windows (Phase 12.3) |
+| `copy-mode` | `-q`, `-t` | Exit/enter copy mode — no-op (Phase 12.4) |
 
 ### Emitted Notifications (7 active + 2 defined but unused)
 
@@ -565,14 +566,15 @@ Subscriptions eliminate polling overhead. iTerm2's `iTermTmuxOptionMonitor` uses
 ### 12.4 — Copy Mode Bridge (LOW)
 
 **Priority**: LOW — iTerm2 only uses `copy-mode -q` defensively
-**Status**: [ ] Not started
+**Status**: [x] Complete
 
-- [ ] Add `CopyMode { quit: bool, target: Option<String> }` to `TmuxCliCommand`
-- [ ] Parse `copy-mode [-q] [-t target]`
-- [ ] Handler for `-q`: reset pane modes (defensive, matches tmux behavior for config errors)
-- [ ] Handler without `-q`: optional — could bridge to WezTerm's copy overlay
+- [x] Add `CopyMode { quit: bool, target: Option<String> }` to `TmuxCliCommand`
+- [x] Parse `copy-mode [-q] [-t target] [-e] [-H] [-M] [-u]`
+- [x] Handler: no-op success (WezTerm manages its own copy overlay independently)
+- [x] Add `copy-mode` to `handle_list_commands` (35→36 commands)
+- [x] 5 new tests (3 parser + 2 handler)
 - **Files**: `command_parser.rs`, `handlers.rs`
-- **Difficulty**: Low (just `-q` flag), Medium (full copy mode bridge to GUI overlay)
+- **Note**: iTerm2 sends `copy-mode -q` on connect as defensive measure (tmux issue #3193)
 
 ### 12.5 — Persistent ID Mapping (MEDIUM)
 

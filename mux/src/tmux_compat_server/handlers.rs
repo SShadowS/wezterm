@@ -596,6 +596,9 @@ pub async fn dispatch_command(
         TmuxCliCommand::MoveWindow { src, dst } => {
             handle_move_window(ctx, &src, &dst)
         }
+        TmuxCliCommand::CopyMode { quit, target: _ } => {
+            handle_copy_mode(quit)
+        }
     }
 }
 
@@ -608,6 +611,7 @@ pub fn handle_list_commands() -> String {
     let mut commands = vec![
         "attach-session",
         "capture-pane",
+        "copy-mode",
         "delete-buffer",
         "detach-client",
         "display-message",
@@ -644,6 +648,18 @@ pub fn handle_list_commands() -> String {
     ];
     commands.sort();
     commands.join("\n")
+}
+
+/// Handle `copy-mode [-q]`.
+///
+/// With `-q`: exits copy mode (no-op for WezTerm — used defensively by iTerm2
+/// to ensure tmux isn't stuck in copy mode after config errors).
+/// Without `-q`: would enter copy mode — accepted silently as a no-op since
+/// WezTerm manages its own copy overlay independently.
+pub fn handle_copy_mode(_quit: bool) -> Result<String, String> {
+    // No-op: WezTerm's copy overlay is independent of tmux CC protocol.
+    // iTerm2 sends `copy-mode -q` on connect as a defensive measure.
+    Ok(String::new())
 }
 
 /// Check whether a session (workspace) exists.
@@ -2610,7 +2626,7 @@ mod tests {
     fn list_commands_contains_all() {
         let output = handle_list_commands();
         let commands: Vec<&str> = output.lines().collect();
-        assert_eq!(commands.len(), 35);
+        assert_eq!(commands.len(), 36);
         assert!(commands.contains(&"attach-session"));
         assert!(commands.contains(&"capture-pane"));
         assert!(commands.contains(&"delete-buffer"));
@@ -2643,6 +2659,7 @@ mod tests {
         assert!(commands.contains(&"show-window-options"));
         assert!(commands.contains(&"split-window"));
         assert!(commands.contains(&"switch-client"));
+        assert!(commands.contains(&"copy-mode"));
         assert!(commands.contains(&"join-pane"));
         assert!(commands.contains(&"move-pane"));
         assert!(commands.contains(&"move-window"));
@@ -2995,5 +3012,17 @@ mod tests {
         handle_refresh_client(&mut ctx, None, None, None, Some("a")).unwrap();
         assert_eq!(ctx.subscriptions.len(), 1);
         assert_eq!(ctx.subscriptions[0].name, "b");
+    }
+
+    // --- Phase 12.4: copy-mode tests ---
+
+    #[test]
+    fn copy_mode_quit_succeeds() {
+        assert_eq!(handle_copy_mode(true), Ok(String::new()));
+    }
+
+    #[test]
+    fn copy_mode_enter_succeeds() {
+        assert_eq!(handle_copy_mode(false), Ok(String::new()));
     }
 }
