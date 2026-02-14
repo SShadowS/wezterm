@@ -71,6 +71,7 @@ pub enum TmuxCliCommand {
         size: Option<String>,
         flags: Option<String>,
         adjust_pane: Option<String>,
+        subscription: Option<String>,
     },
     DisplayMessage {
         print: bool,
@@ -513,6 +514,7 @@ fn parse_refresh_client(args: &[String]) -> Result<TmuxCliCommand> {
     let mut size = None;
     let mut flags = None;
     let mut adjust_pane = None;
+    let mut subscription = None;
 
     let strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     let mut iter = strs.iter().copied();
@@ -521,6 +523,7 @@ fn parse_refresh_client(args: &[String]) -> Result<TmuxCliCommand> {
             "-C" => size = Some(take_flag_value("-C", &mut iter)?),
             "-f" => flags = Some(take_flag_value("-f", &mut iter)?),
             "-A" => adjust_pane = Some(take_flag_value("-A", &mut iter)?),
+            "-B" => subscription = Some(take_flag_value("-B", &mut iter)?),
             other => bail!("refresh-client: unexpected argument: {other:?}"),
         }
     }
@@ -529,6 +532,7 @@ fn parse_refresh_client(args: &[String]) -> Result<TmuxCliCommand> {
         size,
         flags,
         adjust_pane,
+        subscription,
     })
 }
 
@@ -1299,6 +1303,7 @@ mod tests {
                 size: Some("160x40".into()),
                 flags: None,
                 adjust_pane: None,
+                subscription: None,
             }
         );
     }
@@ -1311,6 +1316,7 @@ mod tests {
                 size: None,
                 flags: Some("no-output".into()),
                 adjust_pane: None,
+                subscription: None,
             }
         );
     }
@@ -1323,6 +1329,7 @@ mod tests {
                 size: Some("80x24".into()),
                 flags: Some("no-output".into()),
                 adjust_pane: None,
+                subscription: None,
             }
         );
     }
@@ -1335,6 +1342,7 @@ mod tests {
                 size: None,
                 flags: Some("pause-after=5,wait-exit".into()),
                 adjust_pane: None,
+                subscription: None,
             }
         );
     }
@@ -1347,6 +1355,7 @@ mod tests {
                 size: None,
                 flags: None,
                 adjust_pane: Some("%0:continue".into()),
+                subscription: None,
             }
         );
     }
@@ -1359,6 +1368,33 @@ mod tests {
                 size: None,
                 flags: Some("!pause-after".into()),
                 adjust_pane: None,
+                subscription: None,
+            }
+        );
+    }
+
+    #[test]
+    fn refresh_client_subscription() {
+        assert_eq!(
+            parse("refresh-client -B my-sub:%0:#{pane_id}"),
+            TmuxCliCommand::RefreshClient {
+                size: None,
+                flags: None,
+                adjust_pane: None,
+                subscription: Some("my-sub:%0:#{pane_id}".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn refresh_client_unsubscribe() {
+        assert_eq!(
+            parse("refresh-client -B my-sub"),
+            TmuxCliCommand::RefreshClient {
+                size: None,
+                flags: None,
+                adjust_pane: None,
+                subscription: Some("my-sub".into()),
             }
         );
     }

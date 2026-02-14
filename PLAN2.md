@@ -1,7 +1,7 @@
 # PLAN2.md — Tmux CC Protocol Compatibility Roadmap
 
 **Created**: 2026-02-14
-**Status**: Active development — Phases 1-11 complete, Phase 12 planned
+**Status**: Active development — Phases 1-12.2 complete, Phase 12.3-12.5 remaining
 
 ---
 
@@ -526,19 +526,20 @@ iTerm2 sends `refresh-client -fpause-after=<N>` immediately after connecting to 
 ### 12.2 — Subscription Notifications (HIGH)
 
 **Priority**: HIGH — iTerm2 actively uses for efficient format monitoring
-**Status**: [ ] Not started
+**Status**: [x] Complete
 
 Subscriptions eliminate polling overhead. iTerm2's `iTermTmuxOptionMonitor` uses subscriptions when available (tmux 3.2+), falls back to periodic `display-message` calls otherwise.
 
-- [ ] Add `Subscription { name, target, format, last_value }` struct
-- [ ] Add `subscriptions: Vec<Subscription>` to `HandlerContext`
-- [ ] Parse `refresh-client -B <name>:<target>:<format>` to register subscriptions
-- [ ] Parse `refresh-client -B ""` or `-B <name>:` to unsubscribe
-- [ ] Add periodic check (1s interval) that evaluates each subscription's format string
-- [ ] Only emit notification when value changes (compare with `last_value`)
-- [ ] Wire format: `%subscription-changed <name> $<session_id> @<window_id> <window_index> %<pane_id> : <value>`
-- [ ] Target types: `$<session>`, `@<window>`, `%<pane>`, `%*` (all panes), `@*` (all windows)
-- [ ] Add `subscription_changed_notification()` to `response.rs`
+- [x] Add `Subscription { name, target, format, last_values }` struct with `SubscriptionTarget` enum
+- [x] Add `subscriptions: Vec<Subscription>` to `HandlerContext`
+- [x] Parse `refresh-client -B <name>:<target>:<format>` to register subscriptions
+- [x] Parse `refresh-client -B <name>` to unsubscribe (remove by name)
+- [x] Add periodic check (1s interval) via `check_subscriptions()` in CC connection loop
+- [x] Only emit notification when value changes (compare with `last_values` map)
+- [x] Wire format: `%subscription-changed <name> $<session_id> @<window_id> <window_index> %<pane_id> : <value>`
+- [x] Target types: `$<session>`, `@<window>`, `%<pane>`, `%*` (all panes), `@*` (all windows)
+- [x] Add `subscription_changed_notification()` to `response.rs`
+- [x] 13 new tests (10 handler + 2 parser + 1 response)
 - **Files**: `handlers.rs`, `server.rs`, `response.rs`, `command_parser.rs`
 - **Difficulty**: Medium (timer integration, format evaluation per subscription)
 

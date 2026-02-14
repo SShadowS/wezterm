@@ -202,6 +202,24 @@ pub fn session_window_changed_notification(session_id: u64, window_id: u64) -> S
     format!("%session-window-changed ${} @{}\n", session_id, window_id)
 }
 
+/// `%subscription-changed <name> $<session_id> @<window_id> <window_index> %<pane_id> : <value>`
+///
+/// Sent when a subscription's format evaluates to a different value.
+/// Fields that aren't applicable are replaced with `-`.
+pub fn subscription_changed_notification(
+    name: &str,
+    session_id: &str,
+    window_id: &str,
+    window_index: &str,
+    pane_id: &str,
+    value: &str,
+) -> String {
+    format!(
+        "%subscription-changed {} {} {} {} {} : {}\n",
+        name, session_id, window_id, window_index, pane_id, value
+    )
+}
+
 /// `%exit` or `%exit <reason>`
 pub fn exit_notification(reason: Option<&str>) -> String {
     match reason {
@@ -564,5 +582,13 @@ mod tests {
     #[test]
     fn continue_notification_basic() {
         assert_eq!(continue_notification(3), "%continue %3\n");
+    }
+
+    #[test]
+    fn subscription_changed_notification_basic() {
+        assert_eq!(
+            subscription_changed_notification("my-sub", "$0", "@1", "0", "%5", "hello"),
+            "%subscription-changed my-sub $0 @1 0 %5 : hello\n"
+        );
     }
 }

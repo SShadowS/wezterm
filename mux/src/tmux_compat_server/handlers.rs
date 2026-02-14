@@ -10,7 +10,7 @@ use config::keyassignment::SpawnTabDomain;
 use wezterm_term::TerminalSize;
 
 use crate::domain::SplitSource;
-use crate::pane::PaneId;
+use crate::pane::{Pane, PaneId};
 use crate::tab::{SplitDirection, SplitRequest, SplitSize, Tab};
 use crate::pane::CachePolicy;
 use crate::window::WindowId;
@@ -30,6 +30,36 @@ pub struct ResolvedTarget {
     pub tab_id: Option<crate::tab::TabId>,
     pub window_id: Option<WindowId>,
     pub workspace: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Subscription types
+// ---------------------------------------------------------------------------
+
+/// Target type for a subscription.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SubscriptionTarget {
+    /// `$<session_id>` — monitor a session-level format.
+    Session(u64),
+    /// `@<window_id>` — monitor a specific window.
+    Window(u64),
+    /// `%<pane_id>` — monitor a specific pane.
+    Pane(u64),
+    /// `%*` — monitor all panes in session.
+    AllPanes,
+    /// `@*` — monitor all windows in session.
+    AllWindows,
+}
+
+/// A registered format subscription.
+#[derive(Debug, Clone)]
+pub struct Subscription {
+    pub name: String,
+    pub target: SubscriptionTarget,
+    pub format: String,
+    /// Last evaluated value per entity (keyed by entity ID string, e.g. "%0").
+    /// For single-target subs this has one entry; for `%*`/`@*` it has one per entity.
+    pub last_values: HashMap<String, String>,
 }
 
 /// Per-client connection state for the tmux compat server.
@@ -65,6 +95,8 @@ pub struct HandlerContext {
     /// Per-pane output timestamp tracking. Maps tmux pane ID → Instant of
     /// first unbuffered byte (for age calculation).
     pub pane_output_timestamps: HashMap<u64, std::time::Instant>,
+    /// Format subscriptions registered via `refresh-client -B`.
+    pub subscriptions: Vec<Subscription>,
 }
 
 impl HandlerContext {
@@ -86,6 +118,7 @@ impl HandlerContext {
             wait_exit: false,
             paused_panes: HashMap::new(),
             pane_output_timestamps: HashMap::new(),
+            subscriptions: Vec::new(),
         }
     }
 }
@@ -495,7 +528,8 @@ pub async fn dispatch_command(
             size,
             flags,
             adjust_pane,
-        } => handle_refresh_client(ctx, size.as_deref(), flags.as_deref(), adjust_pane.as_deref()),
+            subscription,
+        } => handle_refresh_client(ctx, size.as_deref(), flags.as_deref(), adjust_pane.as_deref(), subscription.as_deref()),
         TmuxCliCommand::SplitWindow {
             horizontal,
             vertical: _,
@@ -1108,7 +1142,14 @@ pub fn handle_refresh_client(
     size: Option<&str>,
     flags: Option<&str>,
     adjust_pane: Option<&str>,
+    subscription: Option<&str>,
 ) -> Result<String, String> {
+    // Handle -B subscription (register/unregister).
+    // Format: "name:target:format" to subscribe, "name" alone to unsubscribe.
+    if let Some(sub_str) = subscription {
+        handle_subscription(ctx, sub_str)?;
+    }
+
     // Handle -f flags first (doesn't need Mux).
     // Handle -f flags (comma-separated: pause-after=N, wait-exit, !pause-after, etc.)
     if let Some(flags_str) = flags {
@@ -1235,6 +1276,377 @@ fn parse_and_apply_pane_adjust(
     }
 
     Ok(())
+}
+
+/// Handle `-B name:target:format` (subscribe) or `-B name` (unsubscribe).
+///
+/// tmux subscription format: `refresh-client -B "name:target:format"`
+/// - `name` is an arbitrary label for the subscription.
+/// - `target` identifies what to monitor: `%<pane>`, `@<window>`, `$<session>`,
+///   `%*` (all panes), `@*` (all windows).
+/// - `format` is a tmux format string evaluated periodically.
+///
+/// If only `name` is given (no colons), the subscription is removed.
+fn handle_subscription(ctx: &mut HandlerContext, spec: &str) -> Result<(), String> {
+    // Split on first colon — if no colon, it's an unsubscribe.
+    let first_colon = spec.find(':');
+    if first_colon.is_none() {
+        // Unsubscribe: remove by name.
+        let name = spec.trim();
+        ctx.subscriptions.retain(|s| s.name != name);
+        return Ok(());
+    }
+
+    let first_colon = first_colon.unwrap();
+    let name = &spec[..first_colon];
+
+    // Find second colon to split target:format.
+    let rest = &spec[first_colon + 1..];
+    let second_colon = rest.find(':');
+    if second_colon.is_none() {
+        return Err(format!(
+            "invalid subscription format (expected name:target:format): {}",
+            spec
+        ));
+    }
+
+    let second_colon = second_colon.unwrap();
+    let target_str = &rest[..second_colon];
+    let format = &rest[second_colon + 1..];
+
+    let target = parse_subscription_target(target_str)?;
+
+    // Remove existing subscription with the same name (replace semantics).
+    ctx.subscriptions.retain(|s| s.name != name);
+
+    ctx.subscriptions.push(Subscription {
+        name: name.to_string(),
+        target,
+        format: format.to_string(),
+        last_values: HashMap::new(),
+    });
+
+    Ok(())
+}
+
+/// Parse a subscription target string.
+fn parse_subscription_target(s: &str) -> Result<SubscriptionTarget, String> {
+    if s == "%*" {
+        return Ok(SubscriptionTarget::AllPanes);
+    }
+    if s == "@*" {
+        return Ok(SubscriptionTarget::AllWindows);
+    }
+    if let Some(id_str) = s.strip_prefix('%') {
+        let id: u64 = id_str
+            .parse()
+            .map_err(|_| format!("invalid pane id in subscription target: {}", s))?;
+        return Ok(SubscriptionTarget::Pane(id));
+    }
+    if let Some(id_str) = s.strip_prefix('@') {
+        let id: u64 = id_str
+            .parse()
+            .map_err(|_| format!("invalid window id in subscription target: {}", s))?;
+        return Ok(SubscriptionTarget::Window(id));
+    }
+    if let Some(id_str) = s.strip_prefix('$') {
+        let id: u64 = id_str
+            .parse()
+            .map_err(|_| format!("invalid session id in subscription target: {}", s))?;
+        return Ok(SubscriptionTarget::Session(id));
+    }
+    Err(format!("invalid subscription target: {}", s))
+}
+
+/// Check all subscriptions for value changes and emit `%subscription-changed`
+/// notifications for any that have changed.
+///
+/// This should be called periodically (e.g. every ~1s) from the CC connection loop.
+/// It evaluates each subscription's format string against the current state and
+/// compares with the last known value. If different, a notification is emitted and
+/// the stored value is updated.
+pub fn check_subscriptions(ctx: &mut HandlerContext) -> Vec<String> {
+    let mux = match Mux::try_get() {
+        Some(m) => m,
+        None => return Vec::new(),
+    };
+
+    let mut notifications = Vec::new();
+    let session_id_str = ctx
+        .id_map
+        .get_or_create_tmux_session_id(&ctx.workspace)
+        .to_string();
+
+    // Collect all (window_id, tab, window_index) tuples for the workspace.
+    let window_ids: Vec<WindowId> = mux.iter_windows_in_workspace(&ctx.workspace);
+
+    for sub_idx in 0..ctx.subscriptions.len() {
+        match &ctx.subscriptions[sub_idx].target {
+            SubscriptionTarget::Pane(pane_tmux_id) => {
+                let pane_tmux_id = *pane_tmux_id;
+                // Look up the real pane.
+                if let Some(real_pane_id) = ctx.id_map.wezterm_pane_id(pane_tmux_id) {
+                    if let Some(pane) = mux.get_pane(real_pane_id) {
+                        let (window_id_str, window_index_str) =
+                            find_window_for_pane(&mux, &window_ids, &ctx.id_map, real_pane_id);
+                        let fctx = build_pane_format_context_minimal(
+                            &ctx.id_map,
+                            &pane,
+                            &ctx.workspace,
+                        );
+                        let value = expand_format(&ctx.subscriptions[sub_idx].format, &fctx);
+                        let key = format!("%{}", pane_tmux_id);
+                        let changed = ctx.subscriptions[sub_idx]
+                            .last_values
+                            .get(&key)
+                            .map_or(true, |old| old != &value);
+                        if changed {
+                            notifications.push(
+                                super::response::subscription_changed_notification(
+                                    &ctx.subscriptions[sub_idx].name,
+                                    &format!("${}", session_id_str),
+                                    &window_id_str,
+                                    &window_index_str,
+                                    &format!("%{}", pane_tmux_id),
+                                    &value,
+                                ),
+                            );
+                            ctx.subscriptions[sub_idx]
+                                .last_values
+                                .insert(key, value);
+                        }
+                    }
+                }
+            }
+            SubscriptionTarget::Window(window_tmux_id) => {
+                let window_tmux_id = *window_tmux_id;
+                if let Some(real_tab_id) = ctx.id_map.wezterm_tab_id(window_tmux_id) {
+                    for (idx, &wid) in window_ids.iter().enumerate() {
+                        if let Some(win) = mux.get_window(wid) {
+                            for tab in win.iter() {
+                                if tab.tab_id() == real_tab_id {
+                                    let fctx = FormatContext {
+                                        window_id: window_tmux_id,
+                                        window_index: idx as u64,
+                                        session_id: ctx
+                                            .id_map
+                                            .get_or_create_tmux_session_id(&ctx.workspace),
+                                        session_name: ctx.workspace.clone(),
+                                        ..FormatContext::default()
+                                    };
+                                    let value = expand_format(
+                                        &ctx.subscriptions[sub_idx].format,
+                                        &fctx,
+                                    );
+                                    let key = format!("@{}", window_tmux_id);
+                                    let changed = ctx.subscriptions[sub_idx]
+                                        .last_values
+                                        .get(&key)
+                                        .map_or(true, |old| old != &value);
+                                    if changed {
+                                        notifications.push(
+                                            super::response::subscription_changed_notification(
+                                                &ctx.subscriptions[sub_idx].name,
+                                                &format!("${}", session_id_str),
+                                                &format!("@{}", window_tmux_id),
+                                                &idx.to_string(),
+                                                "",
+                                                &value,
+                                            ),
+                                        );
+                                        ctx.subscriptions[sub_idx]
+                                            .last_values
+                                            .insert(key, value);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            SubscriptionTarget::Session(_) => {
+                // Session-level: evaluate format with session context only.
+                let fctx = FormatContext {
+                    session_id: ctx
+                        .id_map
+                        .get_or_create_tmux_session_id(&ctx.workspace),
+                    session_name: ctx.workspace.clone(),
+                    ..FormatContext::default()
+                };
+                let value =
+                    expand_format(&ctx.subscriptions[sub_idx].format, &fctx);
+                let key = format!("${}", session_id_str);
+                let changed = ctx.subscriptions[sub_idx]
+                    .last_values
+                    .get(&key)
+                    .map_or(true, |old| old != &value);
+                if changed {
+                    notifications.push(
+                        super::response::subscription_changed_notification(
+                            &ctx.subscriptions[sub_idx].name,
+                            &format!("${}", session_id_str),
+                            "",
+                            "",
+                            "",
+                            &value,
+                        ),
+                    );
+                    ctx.subscriptions[sub_idx]
+                        .last_values
+                        .insert(key, value);
+                }
+            }
+            SubscriptionTarget::AllPanes => {
+                // Evaluate format for every pane in the workspace.
+                for (idx, &wid) in window_ids.iter().enumerate() {
+                    if let Some(win) = mux.get_window(wid) {
+                        for tab in win.iter() {
+                            let panes = tab.iter_panes_ignoring_zoom();
+                            for pp in &panes {
+                                let real_pid = pp.pane.pane_id();
+                                let tmux_pid =
+                                    ctx.id_map.get_or_create_tmux_pane_id(real_pid);
+                                let tmux_wid =
+                                    ctx.id_map.get_or_create_tmux_window_id(tab.tab_id());
+                                let fctx = build_pane_format_context_minimal(
+                                    &ctx.id_map,
+                                    &pp.pane,
+                                    &ctx.workspace,
+                                );
+                                let value = expand_format(
+                                    &ctx.subscriptions[sub_idx].format,
+                                    &fctx,
+                                );
+                                let key = format!("%{}", tmux_pid);
+                                let changed = ctx.subscriptions[sub_idx]
+                                    .last_values
+                                    .get(&key)
+                                    .map_or(true, |old| old != &value);
+                                if changed {
+                                    notifications.push(
+                                        super::response::subscription_changed_notification(
+                                            &ctx.subscriptions[sub_idx].name,
+                                            &format!("${}", session_id_str),
+                                            &format!("@{}", tmux_wid),
+                                            &idx.to_string(),
+                                            &format!("%{}", tmux_pid),
+                                            &value,
+                                        ),
+                                    );
+                                    ctx.subscriptions[sub_idx]
+                                        .last_values
+                                        .insert(key, value);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            SubscriptionTarget::AllWindows => {
+                // Evaluate format for every window/tab in the workspace.
+                for (idx, &wid) in window_ids.iter().enumerate() {
+                    if let Some(win) = mux.get_window(wid) {
+                        for tab in win.iter() {
+                            let tmux_wid =
+                                ctx.id_map.get_or_create_tmux_window_id(tab.tab_id());
+                            let fctx = FormatContext {
+                                window_id: tmux_wid,
+                                window_index: idx as u64,
+                                session_id: ctx
+                                    .id_map
+                                    .get_or_create_tmux_session_id(&ctx.workspace),
+                                session_name: ctx.workspace.clone(),
+                                ..FormatContext::default()
+                            };
+                            let value = expand_format(
+                                &ctx.subscriptions[sub_idx].format,
+                                &fctx,
+                            );
+                            let key = format!("@{}", tmux_wid);
+                            let changed = ctx.subscriptions[sub_idx]
+                                .last_values
+                                .get(&key)
+                                .map_or(true, |old| old != &value);
+                            if changed {
+                                notifications.push(
+                                    super::response::subscription_changed_notification(
+                                        &ctx.subscriptions[sub_idx].name,
+                                        &format!("${}", session_id_str),
+                                        &format!("@{}", tmux_wid),
+                                        &idx.to_string(),
+                                        "",
+                                        &value,
+                                    ),
+                                );
+                                ctx.subscriptions[sub_idx]
+                                    .last_values
+                                    .insert(key, value);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    notifications
+}
+
+/// Build a minimal FormatContext from a pane reference (for subscriptions).
+fn build_pane_format_context_minimal(
+    id_map: &IdMap,
+    pane: &Arc<dyn Pane>,
+    workspace: &str,
+) -> FormatContext {
+    let tmux_pane_id = id_map.tmux_pane_id(pane.pane_id()).unwrap_or(0);
+    let dims = pane.get_dimensions();
+    let cursor = pane.get_cursor_position();
+    let pane_title = pane.get_title();
+    let pane_current_command = pane
+        .get_foreground_process_name(CachePolicy::AllowStale)
+        .unwrap_or_default();
+    let pane_current_path = pane
+        .get_current_working_dir(CachePolicy::AllowStale)
+        .map(|url| url.path().to_string())
+        .unwrap_or_default();
+
+    FormatContext {
+        pane_id: tmux_pane_id,
+        pane_width: dims.cols as u64,
+        pane_height: dims.viewport_rows as u64,
+        pane_active: true,
+        cursor_x: cursor.x as u64,
+        cursor_y: cursor.y as u64,
+        pane_title,
+        pane_current_command,
+        pane_current_path,
+        session_id: id_map.tmux_session_id(workspace).unwrap_or(0),
+        session_name: workspace.to_string(),
+        ..FormatContext::default()
+    }
+}
+
+/// Find the window ID and index for a given pane.
+fn find_window_for_pane(
+    mux: &Arc<Mux>,
+    window_ids: &[WindowId],
+    id_map: &IdMap,
+    real_pane_id: PaneId,
+) -> (String, String) {
+    for (idx, &wid) in window_ids.iter().enumerate() {
+        if let Some(win) = mux.get_window(wid) {
+            for tab in win.iter() {
+                let panes = tab.iter_panes_ignoring_zoom();
+                for pp in &panes {
+                    if pp.pane.pane_id() == real_pane_id {
+                        let tmux_wid = id_map.tmux_window_id(tab.tab_id()).unwrap_or(0);
+                        return (format!("@{}", tmux_wid), idx.to_string());
+                    }
+                }
+            }
+        }
+    }
+    (String::new(), String::new())
 }
 
 // ---------------------------------------------------------------------------
@@ -2229,7 +2641,7 @@ mod tests {
     #[test]
     fn refresh_client_pause_after_sets_age() {
         let mut ctx = HandlerContext::new("default".to_string());
-        let result = handle_refresh_client(&mut ctx, None, Some("pause-after=5"), None);
+        let result = handle_refresh_client(&mut ctx, None, Some("pause-after=5"), None, None);
         assert!(result.is_ok());
         assert_eq!(ctx.pause_age_ms, Some(5000));
     }
@@ -2237,7 +2649,7 @@ mod tests {
     #[test]
     fn refresh_client_pause_after_zero() {
         let mut ctx = HandlerContext::new("default".to_string());
-        let result = handle_refresh_client(&mut ctx, None, Some("pause-after"), None);
+        let result = handle_refresh_client(&mut ctx, None, Some("pause-after"), None, None);
         assert!(result.is_ok());
         assert_eq!(ctx.pause_age_ms, Some(0));
     }
@@ -2246,7 +2658,7 @@ mod tests {
     fn refresh_client_disable_pause() {
         let mut ctx = HandlerContext::new("default".to_string());
         ctx.pause_age_ms = Some(5000);
-        let result = handle_refresh_client(&mut ctx, None, Some("!pause-after"), None);
+        let result = handle_refresh_client(&mut ctx, None, Some("!pause-after"), None, None);
         assert!(result.is_ok());
         assert_eq!(ctx.pause_age_ms, None);
     }
@@ -2259,6 +2671,7 @@ mod tests {
             None,
             Some("pause-after=3,wait-exit"),
             None,
+            None,
         );
         assert!(result.is_ok());
         assert_eq!(ctx.pause_age_ms, Some(3000));
@@ -2269,7 +2682,7 @@ mod tests {
     fn refresh_client_disable_wait_exit() {
         let mut ctx = HandlerContext::new("default".to_string());
         ctx.wait_exit = true;
-        let result = handle_refresh_client(&mut ctx, None, Some("!wait-exit"), None);
+        let result = handle_refresh_client(&mut ctx, None, Some("!wait-exit"), None, None);
         assert!(result.is_ok());
         assert!(!ctx.wait_exit);
     }
@@ -2278,7 +2691,7 @@ mod tests {
     fn pane_adjust_continue() {
         let mut ctx = HandlerContext::new("default".to_string());
         ctx.paused_panes.insert(0, true);
-        let result = handle_refresh_client(&mut ctx, None, None, Some("%0:continue"));
+        let result = handle_refresh_client(&mut ctx, None, None, Some("%0:continue"), None);
         assert!(result.is_ok());
         assert_eq!(ctx.paused_panes.get(&0), Some(&false));
         assert!(ctx.pending_notifications.iter().any(|n| n.contains("%continue %0")));
@@ -2287,7 +2700,7 @@ mod tests {
     #[test]
     fn pane_adjust_pause() {
         let mut ctx = HandlerContext::new("default".to_string());
-        let result = handle_refresh_client(&mut ctx, None, None, Some("%0:pause"));
+        let result = handle_refresh_client(&mut ctx, None, None, Some("%0:pause"), None);
         assert!(result.is_ok());
         assert_eq!(ctx.paused_panes.get(&0), Some(&true));
         assert!(ctx.pending_notifications.iter().any(|n| n.contains("%pause %0")));
@@ -2296,13 +2709,13 @@ mod tests {
     #[test]
     fn pane_adjust_on_off() {
         let mut ctx = HandlerContext::new("default".to_string());
-        let result = handle_refresh_client(&mut ctx, None, None, Some("%5:off"));
+        let result = handle_refresh_client(&mut ctx, None, None, Some("%5:off"), None);
         assert!(result.is_ok());
         assert_eq!(ctx.paused_panes.get(&5), Some(&true));
         // "off" is silent — no notification.
         assert!(ctx.pending_notifications.is_empty());
 
-        let result = handle_refresh_client(&mut ctx, None, None, Some("%5:on"));
+        let result = handle_refresh_client(&mut ctx, None, None, Some("%5:on"), None);
         assert!(result.is_ok());
         assert_eq!(ctx.paused_panes.get(&5), Some(&false));
         assert!(ctx.pending_notifications.is_empty());
@@ -2311,14 +2724,14 @@ mod tests {
     #[test]
     fn pane_adjust_invalid_format() {
         let mut ctx = HandlerContext::new("default".to_string());
-        let result = handle_refresh_client(&mut ctx, None, None, Some("bad:continue"));
+        let result = handle_refresh_client(&mut ctx, None, None, Some("bad:continue"), None);
         assert!(result.is_err());
     }
 
     #[test]
     fn pane_adjust_unknown_action() {
         let mut ctx = HandlerContext::new("default".to_string());
-        let result = handle_refresh_client(&mut ctx, None, None, Some("%0:unknown"));
+        let result = handle_refresh_client(&mut ctx, None, None, Some("%0:unknown"), None);
         assert!(result.is_err());
     }
 
@@ -2326,8 +2739,109 @@ mod tests {
     fn pane_adjust_continue_not_paused() {
         let mut ctx = HandlerContext::new("default".to_string());
         // Continue on a pane that isn't paused — should be a no-op.
-        let result = handle_refresh_client(&mut ctx, None, None, Some("%0:continue"));
+        let result = handle_refresh_client(&mut ctx, None, None, Some("%0:continue"), None);
         assert!(result.is_ok());
         assert!(ctx.pending_notifications.is_empty());
+    }
+
+    // --- Phase 12.2: subscription tests ---
+
+    #[test]
+    fn subscription_register() {
+        let mut ctx = HandlerContext::new("default".to_string());
+        let result = handle_refresh_client(
+            &mut ctx,
+            None,
+            None,
+            None,
+            Some("my-sub:%0:#{pane_id}"),
+        );
+        assert!(result.is_ok());
+        assert_eq!(ctx.subscriptions.len(), 1);
+        assert_eq!(ctx.subscriptions[0].name, "my-sub");
+        assert_eq!(ctx.subscriptions[0].target, SubscriptionTarget::Pane(0));
+        assert_eq!(ctx.subscriptions[0].format, "#{pane_id}");
+    }
+
+    #[test]
+    fn subscription_unregister() {
+        let mut ctx = HandlerContext::new("default".to_string());
+        // Register first.
+        handle_refresh_client(&mut ctx, None, None, None, Some("test:%0:#{pane_id}")).unwrap();
+        assert_eq!(ctx.subscriptions.len(), 1);
+        // Unregister by name only.
+        handle_refresh_client(&mut ctx, None, None, None, Some("test")).unwrap();
+        assert_eq!(ctx.subscriptions.len(), 0);
+    }
+
+    #[test]
+    fn subscription_replace() {
+        let mut ctx = HandlerContext::new("default".to_string());
+        // Register with one format.
+        handle_refresh_client(&mut ctx, None, None, None, Some("sub1:%0:#{pane_id}")).unwrap();
+        assert_eq!(ctx.subscriptions[0].format, "#{pane_id}");
+        // Replace with different format (same name).
+        handle_refresh_client(&mut ctx, None, None, None, Some("sub1:%1:#{pane_width}")).unwrap();
+        assert_eq!(ctx.subscriptions.len(), 1);
+        assert_eq!(ctx.subscriptions[0].format, "#{pane_width}");
+        assert_eq!(ctx.subscriptions[0].target, SubscriptionTarget::Pane(1));
+    }
+
+    #[test]
+    fn subscription_all_panes_target() {
+        let mut ctx = HandlerContext::new("default".to_string());
+        handle_refresh_client(&mut ctx, None, None, None, Some("all:%*:#{pane_id}")).unwrap();
+        assert_eq!(ctx.subscriptions[0].target, SubscriptionTarget::AllPanes);
+    }
+
+    #[test]
+    fn subscription_all_windows_target() {
+        let mut ctx = HandlerContext::new("default".to_string());
+        handle_refresh_client(&mut ctx, None, None, None, Some("all:@*:#{window_id}")).unwrap();
+        assert_eq!(
+            ctx.subscriptions[0].target,
+            SubscriptionTarget::AllWindows
+        );
+    }
+
+    #[test]
+    fn subscription_session_target() {
+        let mut ctx = HandlerContext::new("default".to_string());
+        handle_refresh_client(&mut ctx, None, None, None, Some("s:$0:#{session_name}")).unwrap();
+        assert_eq!(ctx.subscriptions[0].target, SubscriptionTarget::Session(0));
+    }
+
+    #[test]
+    fn subscription_window_target() {
+        let mut ctx = HandlerContext::new("default".to_string());
+        handle_refresh_client(&mut ctx, None, None, None, Some("w:@3:#{window_id}")).unwrap();
+        assert_eq!(ctx.subscriptions[0].target, SubscriptionTarget::Window(3));
+    }
+
+    #[test]
+    fn subscription_invalid_format() {
+        let mut ctx = HandlerContext::new("default".to_string());
+        // Missing second colon — should error.
+        let result = handle_refresh_client(&mut ctx, None, None, None, Some("name:bad"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn subscription_invalid_target() {
+        let mut ctx = HandlerContext::new("default".to_string());
+        let result = handle_refresh_client(&mut ctx, None, None, None, Some("name:invalid:fmt"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn subscription_multiple() {
+        let mut ctx = HandlerContext::new("default".to_string());
+        handle_refresh_client(&mut ctx, None, None, None, Some("a:%0:#{pane_id}")).unwrap();
+        handle_refresh_client(&mut ctx, None, None, None, Some("b:%1:#{pane_id}")).unwrap();
+        assert_eq!(ctx.subscriptions.len(), 2);
+        // Unregister just one.
+        handle_refresh_client(&mut ctx, None, None, None, Some("a")).unwrap();
+        assert_eq!(ctx.subscriptions.len(), 1);
+        assert_eq!(ctx.subscriptions[0].name, "b");
     }
 }

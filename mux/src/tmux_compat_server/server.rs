@@ -546,6 +546,7 @@ fn process_cc_connection_sync(
     // BufReader::get_mut() don't work reliably on Windows.
     let mut read_buf = vec![0u8; 4096];
     let mut accum = String::new();
+    let mut last_subscription_check = std::time::Instant::now();
     loop {
         // Drain any pending output before blocking on read.
         drain_output_taps(&mut session, &output_rx, &mut stream)?;
@@ -627,6 +628,18 @@ fn process_cc_connection_sync(
 
         // Drain output after command response too.
         drain_output_taps(&mut session, &output_rx, &mut stream)?;
+
+        // Check subscriptions periodically (every ~1s).
+        if last_subscription_check.elapsed() >= std::time::Duration::from_secs(1) {
+            let sub_notifs = super::handlers::check_subscriptions(&mut session.ctx);
+            for notif in sub_notifs {
+                std::io::Write::write_all(&mut stream, notif.as_bytes())?;
+            }
+            if !session.ctx.subscriptions.is_empty() {
+                std::io::Write::flush(&mut stream)?;
+            }
+            last_subscription_check = std::time::Instant::now();
+        }
 
         // If detach was requested, send %exit and close the connection.
         if session.ctx.detach_requested {
