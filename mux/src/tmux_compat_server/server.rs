@@ -585,7 +585,10 @@ fn process_cc_connection_sync(
                         Ok(body) => Ok(body),
                         Err(e) => Err(e),
                     },
-                    Err(e) => Err(format!("{}", e)),
+                    Err(e) => {
+                        log::warn!("tmux compat: command parse error: {e} (input: {cmd_line:?})");
+                        Err(format!("{}", e))
+                    }
                 };
                 let _ = resp_tx.send((resp, ctx));
             })

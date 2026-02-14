@@ -15,6 +15,8 @@ pub enum TmuxCliCommand {
         target: Option<String>,
         size: Option<String>,
         print_and_format: Option<String>,
+        cwd: Option<String>,
+        env: Vec<String>,
     },
     SendKeys {
         target: Option<String>,
@@ -48,6 +50,8 @@ pub enum TmuxCliCommand {
         target: Option<String>,
         name: Option<String>,
         print_and_format: Option<String>,
+        cwd: Option<String>,
+        env: Vec<String>,
     },
     SelectWindow {
         target: Option<String>,
@@ -79,6 +83,7 @@ pub enum TmuxCliCommand {
     },
     DisplayMessage {
         print: bool,
+        verbose: bool,
         format: Option<String>,
         target: Option<String>,
     },
@@ -105,15 +110,19 @@ pub enum TmuxCliCommand {
         window_name: Option<String>,
         detached: bool,
         print_and_format: Option<String>,
+        cwd: Option<String>,
+        env: Vec<String>,
     },
     ShowOptions {
         global: bool,
         value_only: bool,
+        quiet: bool,
         option_name: Option<String>,
     },
     ShowWindowOptions {
         global: bool,
         value_only: bool,
+        quiet: bool,
         option_name: Option<String>,
     },
     AttachSession {
@@ -179,6 +188,26 @@ pub enum TmuxCliCommand {
         source: Option<String>,
         target: Option<String>,
     },
+    // Phase 17: missing commands for cleanup & orchestration
+    KillServer,
+    WaitFor {
+        signal: bool,
+        channel: String,
+    },
+    PipePane {
+        target: Option<String>,
+        command: Option<String>,
+    },
+    DisplayPopup {
+        target: Option<String>,
+    },
+    RunShell {
+        background: bool,
+        target: Option<String>,
+        command: Option<String>,
+    },
+    // Phase 19: diagnostic & debugging
+    ServerInfo,
 }
 
 /// Parse a tmux command line into a structured [`TmuxCliCommand`].
@@ -202,24 +231,24 @@ pub fn parse_command(line: &str) -> Result<TmuxCliCommand> {
     let args = &words[1..];
 
     match command_name.as_str() {
-        "split-window" => parse_split_window(args),
-        "send-keys" => parse_send_keys(args),
-        "capture-pane" => parse_capture_pane(args),
-        "list-panes" => parse_list_panes(args),
-        "list-windows" => parse_list_windows(args),
-        "list-sessions" => parse_list_sessions(args),
-        "new-window" => parse_new_window(args),
-        "select-window" => parse_select_window(args),
-        "select-pane" => parse_select_pane(args),
-        "kill-pane" => parse_kill_pane(args),
+        "split-window" | "splitw" => parse_split_window(args),
+        "send-keys" | "send" => parse_send_keys(args),
+        "capture-pane" | "capturep" => parse_capture_pane(args),
+        "list-panes" | "lsp" => parse_list_panes(args),
+        "list-windows" | "lsw" => parse_list_windows(args),
+        "list-sessions" | "ls" => parse_list_sessions(args),
+        "new-window" | "neww" => parse_new_window(args),
+        "select-window" | "selectw" => parse_select_window(args),
+        "select-pane" | "selectp" => parse_select_pane(args),
+        "kill-pane" | "killp" => parse_kill_pane(args),
         "resize-pane" | "resizep" => parse_resize_pane(args),
-        "resize-window" => parse_resize_window(args),
-        "refresh-client" => parse_refresh_client(args),
-        "display-message" => parse_display_message(args),
-        "has-session" => parse_has_session(args),
+        "resize-window" | "resizew" => parse_resize_window(args),
+        "refresh-client" | "refresh" => parse_refresh_client(args),
+        "display-message" | "display" => parse_display_message(args),
+        "has-session" | "has" => parse_has_session(args),
         "list-commands" | "lscm" => Ok(TmuxCliCommand::ListCommands),
         "kill-window" | "killw" => parse_kill_window(args),
-        "kill-session" => parse_kill_session(args),
+        "kill-session" | "kills" => parse_kill_session(args),
         "rename-window" | "renamew" => parse_rename_window(args),
         "rename-session" | "rename" => parse_rename_session(args),
         "new-session" | "new" => parse_new_session(args),
@@ -241,6 +270,14 @@ pub fn parse_command(line: &str) -> Result<TmuxCliCommand> {
         "set-option" | "set" => parse_set_option(args),
         "select-layout" | "selectl" => parse_select_layout(args),
         "break-pane" | "breakp" => parse_break_pane(args),
+        // Phase 17: missing commands for cleanup & orchestration
+        "kill-server" => Ok(TmuxCliCommand::KillServer),
+        "wait-for" | "wait" => parse_wait_for(args),
+        "pipe-pane" | "pipep" => parse_pipe_pane(args),
+        "display-popup" | "popup" | "display-menu" | "menu" => parse_display_popup(args),
+        "run-shell" | "run" => parse_run_shell(args),
+        // Phase 19: diagnostic & debugging
+        "server-info" | "info" => Ok(TmuxCliCommand::ServerInfo),
         other => bail!("unknown tmux command: {other:?}"),
     }
 }
@@ -263,6 +300,8 @@ fn parse_split_window(args: &[String]) -> Result<TmuxCliCommand> {
     let mut size = None;
     let mut print_info = false;
     let mut format = None;
+    let mut cwd = None;
+    let mut env = Vec::new();
 
     let strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     let mut iter = strs.iter().copied();
@@ -276,14 +315,8 @@ fn parse_split_window(args: &[String]) -> Result<TmuxCliCommand> {
             "-F" => format = Some(take_flag_value("-F", &mut iter)?),
             // Flags we accept but ignore: -d (detach), -b (before), -f (full-width/height)
             "-d" | "-b" | "-f" | "-Z" | "-I" => {}
-            // -e takes a value (environment) — ignore
-            "-e" => {
-                let _ = take_flag_value("-e", &mut iter)?;
-            }
-            // -c takes a value (start directory) — ignore
-            "-c" => {
-                let _ = take_flag_value("-c", &mut iter)?;
-            }
+            "-e" => env.push(take_flag_value("-e", &mut iter)?),
+            "-c" => cwd = Some(take_flag_value("-c", &mut iter)?),
             other => bail!("split-window: unexpected argument: {other:?}"),
         }
     }
@@ -300,6 +333,8 @@ fn parse_split_window(args: &[String]) -> Result<TmuxCliCommand> {
         target,
         size,
         print_and_format,
+        cwd,
+        env,
     })
 }
 
@@ -447,6 +482,8 @@ fn parse_new_window(args: &[String]) -> Result<TmuxCliCommand> {
     let mut name = None;
     let mut print_info = false;
     let mut format = None;
+    let mut cwd = None;
+    let mut env = Vec::new();
 
     let strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     let mut iter = strs.iter().copied();
@@ -458,12 +495,8 @@ fn parse_new_window(args: &[String]) -> Result<TmuxCliCommand> {
             "-F" => format = Some(take_flag_value("-F", &mut iter)?),
             // Flags we accept but ignore
             "-d" | "-S" | "-a" | "-b" | "-k" => {}
-            "-e" => {
-                let _ = take_flag_value("-e", &mut iter)?;
-            }
-            "-c" => {
-                let _ = take_flag_value("-c", &mut iter)?;
-            }
+            "-e" => env.push(take_flag_value("-e", &mut iter)?),
+            "-c" => cwd = Some(take_flag_value("-c", &mut iter)?),
             other => bail!("new-window: unexpected argument: {other:?}"),
         }
     }
@@ -478,6 +511,8 @@ fn parse_new_window(args: &[String]) -> Result<TmuxCliCommand> {
         target,
         name,
         print_and_format,
+        cwd,
+        env,
     })
 }
 
@@ -644,6 +679,7 @@ fn parse_refresh_client(args: &[String]) -> Result<TmuxCliCommand> {
 
 fn parse_display_message(args: &[String]) -> Result<TmuxCliCommand> {
     let mut print = false;
+    let mut verbose = false;
     let mut format = None;
     let mut target = None;
 
@@ -652,9 +688,10 @@ fn parse_display_message(args: &[String]) -> Result<TmuxCliCommand> {
     while let Some(arg) = iter.next() {
         match arg {
             "-p" => print = true,
+            "-v" => verbose = true,
             "-t" => target = Some(take_flag_value("-t", &mut iter)?),
             // Flags we accept but ignore
-            "-v" | "-a" | "-I" | "-N" => {}
+            "-a" | "-I" | "-N" => {}
             "-c" => {
                 let _ = take_flag_value("-c", &mut iter)?;
             }
@@ -668,6 +705,7 @@ fn parse_display_message(args: &[String]) -> Result<TmuxCliCommand> {
 
     Ok(TmuxCliCommand::DisplayMessage {
         print,
+        verbose,
         format,
         target,
     })
@@ -764,6 +802,8 @@ fn parse_new_session(args: &[String]) -> Result<TmuxCliCommand> {
     let mut detached = false;
     let mut print_info = false;
     let mut format = None;
+    let mut cwd = None;
+    let mut env = Vec::new();
 
     let strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     let mut iter = strs.iter().copied();
@@ -785,12 +825,8 @@ fn parse_new_session(args: &[String]) -> Result<TmuxCliCommand> {
             "-y" => {
                 let _ = take_flag_value("-y", &mut iter)?;
             }
-            "-e" => {
-                let _ = take_flag_value("-e", &mut iter)?;
-            }
-            "-c" => {
-                let _ = take_flag_value("-c", &mut iter)?;
-            }
+            "-e" => env.push(take_flag_value("-e", &mut iter)?),
+            "-c" => cwd = Some(take_flag_value("-c", &mut iter)?),
             "-f" => {
                 let _ = take_flag_value("-f", &mut iter)?;
             }
@@ -809,33 +845,41 @@ fn parse_new_session(args: &[String]) -> Result<TmuxCliCommand> {
         window_name,
         detached,
         print_and_format,
+        cwd,
+        env,
     })
 }
 
 fn parse_show_options(args: &[String]) -> Result<TmuxCliCommand> {
     let mut global = false;
     let mut value_only = false;
+    let mut quiet = false;
     let mut option_name = None;
 
     let strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     let mut iter = strs.iter().copied();
     while let Some(arg) = iter.next() {
-        match arg {
-            "-g" => global = true,
-            "-v" => value_only = true,
-            "-gv" | "-vg" => {
-                global = true;
-                value_only = true;
+        // Parse combined flags like -gvq, -qgv, etc.
+        if arg.starts_with('-') && arg.len() > 1 && arg.chars().skip(1).all(|c| "gvqs".contains(c))
+        {
+            for ch in arg.chars().skip(1) {
+                match ch {
+                    'g' => global = true,
+                    'v' => value_only = true,
+                    'q' => quiet = true,
+                    's' => global = true, // -s (server) is equivalent to -g (global)
+                    _ => {}
+                }
             }
-            _ => {
-                option_name = Some(arg.to_string());
-            }
+        } else {
+            option_name = Some(arg.to_string());
         }
     }
 
     Ok(TmuxCliCommand::ShowOptions {
         global,
         value_only,
+        quiet,
         option_name,
     })
 }
@@ -843,27 +887,32 @@ fn parse_show_options(args: &[String]) -> Result<TmuxCliCommand> {
 fn parse_show_window_options(args: &[String]) -> Result<TmuxCliCommand> {
     let mut global = false;
     let mut value_only = false;
+    let mut quiet = false;
     let mut option_name = None;
 
     let strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     let mut iter = strs.iter().copied();
     while let Some(arg) = iter.next() {
-        match arg {
-            "-g" => global = true,
-            "-v" => value_only = true,
-            "-gv" | "-vg" => {
-                global = true;
-                value_only = true;
+        // Parse combined flags like -gvq, -qgv, etc.
+        if arg.starts_with('-') && arg.len() > 1 && arg.chars().skip(1).all(|c| "gvq".contains(c))
+        {
+            for ch in arg.chars().skip(1) {
+                match ch {
+                    'g' => global = true,
+                    'v' => value_only = true,
+                    'q' => quiet = true,
+                    _ => {}
+                }
             }
-            _ => {
-                option_name = Some(arg.to_string());
-            }
+        } else {
+            option_name = Some(arg.to_string());
         }
     }
 
     Ok(TmuxCliCommand::ShowWindowOptions {
         global,
         value_only,
+        quiet,
         option_name,
     })
 }
@@ -1217,13 +1266,112 @@ fn parse_break_pane(args: &[String]) -> Result<TmuxCliCommand> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Phase 17: missing commands for cleanup & orchestration
+// ---------------------------------------------------------------------------
+
+fn parse_wait_for(args: &[String]) -> Result<TmuxCliCommand> {
+    let mut signal = false;
+    let mut channel = None;
+
+    let strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let mut iter = strs.iter().copied();
+    while let Some(arg) = iter.next() {
+        match arg {
+            "-S" => signal = true,
+            "-L" | "-U" => {
+                // Lock/unlock — accept but treat like signal
+            }
+            _ => {
+                channel = Some(arg.to_string());
+            }
+        }
+    }
+
+    let channel = channel.unwrap_or_default();
+    Ok(TmuxCliCommand::WaitFor { signal, channel })
+}
+
+fn parse_pipe_pane(args: &[String]) -> Result<TmuxCliCommand> {
+    let mut target = None;
+    let mut command = None;
+
+    let strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let mut iter = strs.iter().copied();
+    while let Some(arg) = iter.next() {
+        match arg {
+            "-t" => target = Some(take_flag_value("-t", &mut iter)?),
+            "-o" | "-O" | "-I" => {
+                // Accept but ignore output/input flags
+            }
+            _ => {
+                command = Some(arg.to_string());
+            }
+        }
+    }
+
+    Ok(TmuxCliCommand::PipePane { target, command })
+}
+
+fn parse_display_popup(args: &[String]) -> Result<TmuxCliCommand> {
+    let mut target = None;
+
+    let strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let mut iter = strs.iter().copied();
+    while let Some(arg) = iter.next() {
+        match arg {
+            "-t" => target = Some(take_flag_value("-t", &mut iter)?),
+            // Accept and ignore all other flags with values
+            "-d" | "-e" | "-h" | "-w" | "-x" | "-y" | "-s" | "-S" | "-T" | "-B" | "-b"
+            | "-C" => {
+                let _ = take_flag_value(arg, &mut iter)?;
+            }
+            // Flags without values
+            "-E" | "-EE" => {}
+            _ => {
+                // Remaining args are the popup command — ignore
+            }
+        }
+    }
+
+    Ok(TmuxCliCommand::DisplayPopup { target })
+}
+
+fn parse_run_shell(args: &[String]) -> Result<TmuxCliCommand> {
+    let mut background = false;
+    let mut target = None;
+    let mut command = None;
+
+    let strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let mut iter = strs.iter().copied();
+    while let Some(arg) = iter.next() {
+        match arg {
+            "-b" => background = true,
+            "-C" => {} // tmux command mode — ignore
+            "-t" => target = Some(take_flag_value("-t", &mut iter)?),
+            "-d" => {
+                let _ = take_flag_value("-d", &mut iter)?; // delay — ignore
+            }
+            _ => {
+                command = Some(arg.to_string());
+            }
+        }
+    }
+
+    Ok(TmuxCliCommand::RunShell {
+        background,
+        target,
+        command,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// Helper to reduce boilerplate in assertions.
     fn parse(s: &str) -> TmuxCliCommand {
-        parse_command(s).unwrap_or_else(|e| panic!("parse_command({s:?}) failed: {e}"))
+        parse_command(s).unwrap_or_else(|e| panic!("parse_command({:?}) failed: {}", s, e))
     }
 
     // ---------------------------------------------------------------
@@ -1240,6 +1388,8 @@ mod tests {
                 target: None,
                 size: None,
                 print_and_format: None,
+            cwd: None,
+            env: vec![],
             }
         );
     }
@@ -1254,6 +1404,8 @@ mod tests {
                 target: Some("%3".into()),
                 size: None,
                 print_and_format: None,
+            cwd: None,
+            env: vec![],
             }
         );
     }
@@ -1268,6 +1420,8 @@ mod tests {
                 target: None,
                 size: None,
                 print_and_format: None,
+            cwd: None,
+            env: vec![],
             }
         );
     }
@@ -1282,6 +1436,8 @@ mod tests {
                 target: None,
                 size: Some("50%".into()),
                 print_and_format: None,
+            cwd: None,
+            env: vec![],
             }
         );
     }
@@ -1496,6 +1652,8 @@ mod tests {
                 target: None,
                 name: None,
                 print_and_format: None,
+            cwd: None,
+            env: vec![],
             }
         );
     }
@@ -1508,6 +1666,8 @@ mod tests {
                 target: None,
                 name: Some("mywin".into()),
                 print_and_format: None,
+            cwd: None,
+            env: vec![],
             }
         );
     }
@@ -1520,6 +1680,8 @@ mod tests {
                 target: Some("$0".into()),
                 name: Some("editor".into()),
                 print_and_format: None,
+            cwd: None,
+            env: vec![],
             }
         );
     }
@@ -1732,6 +1894,7 @@ mod tests {
             parse("display-message -p '#{session_id}'"),
             TmuxCliCommand::DisplayMessage {
                 print: true,
+                verbose: false,
                 format: Some("#{session_id}".into()),
                 target: None,
             }
@@ -1744,6 +1907,7 @@ mod tests {
             parse("display-message"),
             TmuxCliCommand::DisplayMessage {
                 print: false,
+                verbose: false,
                 format: None,
                 target: None,
             }
@@ -1756,6 +1920,7 @@ mod tests {
             parse("display-message '#{window_id}'"),
             TmuxCliCommand::DisplayMessage {
                 print: false,
+                verbose: false,
                 format: Some("#{window_id}".into()),
                 target: None,
             }
@@ -2056,6 +2221,8 @@ mod tests {
                 window_name: None,
                 detached: false,
                 print_and_format: None,
+            cwd: None,
+            env: vec![],
             }
         );
     }
@@ -2069,6 +2236,8 @@ mod tests {
                 window_name: None,
                 detached: false,
                 print_and_format: None,
+            cwd: None,
+            env: vec![],
             }
         );
     }
@@ -2082,6 +2251,8 @@ mod tests {
                 window_name: None,
                 detached: false,
                 print_and_format: None,
+            cwd: None,
+            env: vec![],
             }
         );
     }
@@ -2097,6 +2268,7 @@ mod tests {
             TmuxCliCommand::ShowOptions {
                 global: true,
                 value_only: true,
+                quiet: false,
                 option_name: Some("default-terminal".into()),
             }
         );
@@ -2109,6 +2281,7 @@ mod tests {
             TmuxCliCommand::ShowOptions {
                 global: true,
                 value_only: false,
+                quiet: false,
                 option_name: None,
             }
         );
@@ -2121,6 +2294,7 @@ mod tests {
             TmuxCliCommand::ShowOptions {
                 global: true,
                 value_only: true,
+                quiet: false,
                 option_name: Some("escape-time".into()),
             }
         );
@@ -2133,7 +2307,35 @@ mod tests {
             TmuxCliCommand::ShowOptions {
                 global: true,
                 value_only: true,
+                quiet: false,
                 option_name: Some("set-clipboard".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn show_options_quiet_flag() {
+        assert_eq!(
+            parse("show-options -gqv nonexistent"),
+            TmuxCliCommand::ShowOptions {
+                global: true,
+                value_only: true,
+                quiet: true,
+                option_name: Some("nonexistent".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn show_options_server_flag() {
+        // -s is equivalent to -g (server scope = global)
+        assert_eq!(
+            parse("show-options -sv default-terminal"),
+            TmuxCliCommand::ShowOptions {
+                global: true,
+                value_only: true,
+                quiet: false,
+                option_name: Some("default-terminal".into()),
             }
         );
     }
@@ -2149,6 +2351,7 @@ mod tests {
             TmuxCliCommand::ShowWindowOptions {
                 global: true,
                 value_only: true,
+                quiet: false,
                 option_name: Some("aggressive-resize".into()),
             }
         );
@@ -2161,6 +2364,7 @@ mod tests {
             TmuxCliCommand::ShowWindowOptions {
                 global: true,
                 value_only: true,
+                quiet: false,
                 option_name: Some("aggressive-resize".into()),
             }
         );
@@ -2173,7 +2377,21 @@ mod tests {
             TmuxCliCommand::ShowWindowOptions {
                 global: false,
                 value_only: false,
+                quiet: false,
                 option_name: None,
+            }
+        );
+    }
+
+    #[test]
+    fn show_window_options_quiet_flag() {
+        assert_eq!(
+            parse("showw -gqv nonexistent"),
+            TmuxCliCommand::ShowWindowOptions {
+                global: true,
+                value_only: true,
+                quiet: true,
+                option_name: Some("nonexistent".into()),
             }
         );
     }
@@ -2476,6 +2694,8 @@ mod tests {
                 target: Some("%5".into()),
                 size: Some("70%".into()),
                 print_and_format: Some("#{pane_id}".into()),
+            cwd: None,
+            env: vec![],
             }
         );
     }
@@ -2490,21 +2710,25 @@ mod tests {
                 target: None,
                 size: None,
                 print_and_format: Some("#{session_name}:#{window_index}.#{pane_index}".into()),
+            cwd: None,
+            env: vec![],
             }
         );
     }
 
     #[test]
-    fn split_window_ignores_extra_flags() {
-        // Claude Code may send -d, -b, -f, -c, -e flags
+    fn split_window_extra_flags() {
+        // Claude Code sends -d, -b, -f, -c, -e flags; -c/-e are now wired through
         assert_eq!(
-            parse("split-window -h -d -c /tmp"),
+            parse("split-window -h -d -c /tmp -e FOO=bar"),
             TmuxCliCommand::SplitWindow {
                 horizontal: true,
                 vertical: false,
                 target: None,
                 size: None,
                 print_and_format: None,
+                cwd: Some("/tmp".into()),
+                env: vec!["FOO=bar".into()],
             }
         );
     }
@@ -2517,6 +2741,8 @@ mod tests {
                 target: Some("main".into()),
                 name: Some("editor".into()),
                 print_and_format: Some("#{pane_id}".into()),
+            cwd: None,
+            env: vec![],
             }
         );
     }
@@ -2530,6 +2756,8 @@ mod tests {
                 window_name: Some("main".into()),
                 detached: true,
                 print_and_format: Some("#{pane_id}".into()),
+            cwd: None,
+            env: vec![],
             }
         );
     }
@@ -2577,6 +2805,7 @@ mod tests {
             parse("display-message -t %5 -p '#{session_name}:#{window_index}'"),
             TmuxCliCommand::DisplayMessage {
                 print: true,
+                verbose: false,
                 format: Some("#{session_name}:#{window_index}".into()),
                 target: Some("%5".into()),
             }
@@ -2687,6 +2916,586 @@ mod tests {
                 width: None,
                 height: Some(50),
                 zoom: false,
+            }
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 16: command alias tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn alias_ls_for_list_sessions() {
+        assert_eq!(
+            parse("ls"),
+            TmuxCliCommand::ListSessions { format: None }
+        );
+    }
+
+    #[test]
+    fn alias_ls_with_format() {
+        assert_eq!(
+            parse("ls -F '#{session_name}'"),
+            TmuxCliCommand::ListSessions {
+                format: Some("#{session_name}".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn alias_lsp_for_list_panes() {
+        assert_eq!(
+            parse("lsp"),
+            TmuxCliCommand::ListPanes {
+                all: false,
+                session: false,
+                format: None,
+                target: None,
+            }
+        );
+    }
+
+    #[test]
+    fn alias_lsw_for_list_windows() {
+        assert_eq!(
+            parse("lsw"),
+            TmuxCliCommand::ListWindows {
+                all: false,
+                format: None,
+                target: None,
+            }
+        );
+    }
+
+    #[test]
+    fn alias_splitw_for_split_window() {
+        assert_eq!(
+            parse("splitw -h"),
+            TmuxCliCommand::SplitWindow {
+                horizontal: true,
+                vertical: false,
+                target: None,
+                size: None,
+                print_and_format: None,
+            cwd: None,
+            env: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn alias_neww_for_new_window() {
+        assert_eq!(
+            parse("neww -n test"),
+            TmuxCliCommand::NewWindow {
+                target: None,
+                name: Some("test".into()),
+                print_and_format: None,
+            cwd: None,
+            env: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn alias_selectw_for_select_window() {
+        assert_eq!(
+            parse("selectw -t @1"),
+            TmuxCliCommand::SelectWindow {
+                target: Some("@1".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn alias_selectp_for_select_pane() {
+        assert_eq!(
+            parse("selectp -t %0"),
+            TmuxCliCommand::SelectPane {
+                target: Some("%0".into()),
+                style: None,
+                title: None,
+            }
+        );
+    }
+
+    #[test]
+    fn alias_killp_for_kill_pane() {
+        assert_eq!(
+            parse("killp -t %1"),
+            TmuxCliCommand::KillPane {
+                target: Some("%1".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn alias_capturep_for_capture_pane() {
+        assert_eq!(
+            parse("capturep -p -t %0"),
+            TmuxCliCommand::CapturePane {
+                print: true,
+                target: Some("%0".into()),
+                escape: false,
+                octal_escape: false,
+                start_line: None,
+                end_line: None,
+            }
+        );
+    }
+
+    #[test]
+    fn alias_send_for_send_keys() {
+        assert_eq!(
+            parse("send -t %0 -l hello"),
+            TmuxCliCommand::SendKeys {
+                target: Some("%0".into()),
+                literal: true,
+                hex: false,
+                keys: vec!["hello".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn alias_display_for_display_message() {
+        assert_eq!(
+            parse("display -p '#{pane_id}'"),
+            TmuxCliCommand::DisplayMessage {
+                print: true,
+                verbose: false,
+                format: Some("#{pane_id}".into()),
+                target: None,
+            }
+        );
+    }
+
+    #[test]
+    fn alias_has_for_has_session() {
+        assert_eq!(
+            parse("has -t main"),
+            TmuxCliCommand::HasSession {
+                target: Some("main".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn alias_kills_for_kill_session() {
+        assert_eq!(
+            parse("kills -t old"),
+            TmuxCliCommand::KillSession {
+                target: Some("old".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn alias_resizew_for_resize_window() {
+        assert_eq!(
+            parse("resizew -t @0 -x 120 -y 40"),
+            TmuxCliCommand::ResizeWindow {
+                target: Some("@0".into()),
+                width: Some(120),
+                height: Some(40),
+            }
+        );
+    }
+
+    #[test]
+    fn alias_refresh_for_refresh_client() {
+        // "refresh" is alias for "refresh-client"
+        assert_eq!(
+            parse("refresh -C 200x50"),
+            TmuxCliCommand::RefreshClient {
+                size: Some("200x50".into()),
+                flags: None,
+                adjust_pane: None,
+                subscription: None,
+            }
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 17: parser tests for missing commands
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn phase17_kill_server() {
+        assert_eq!(parse("kill-server"), TmuxCliCommand::KillServer);
+    }
+
+    #[test]
+    fn phase17_wait_for_signal() {
+        assert_eq!(
+            parse("wait-for -S mychannel"),
+            TmuxCliCommand::WaitFor {
+                signal: true,
+                channel: "mychannel".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn phase17_wait_for_lock() {
+        assert_eq!(
+            parse("wait-for -L lockname"),
+            TmuxCliCommand::WaitFor {
+                signal: false,
+                channel: "lockname".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn phase17_wait_alias() {
+        assert_eq!(
+            parse("wait -S done"),
+            TmuxCliCommand::WaitFor {
+                signal: true,
+                channel: "done".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn phase17_pipe_pane_with_command() {
+        assert_eq!(
+            parse("pipe-pane -t %3 \"cat >> /tmp/log\""),
+            TmuxCliCommand::PipePane {
+                target: Some("%3".into()),
+                command: Some("cat >> /tmp/log".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn phase17_pipe_pane_no_args() {
+        assert_eq!(
+            parse("pipe-pane"),
+            TmuxCliCommand::PipePane {
+                target: None,
+                command: None,
+            }
+        );
+    }
+
+    #[test]
+    fn phase17_pipep_alias() {
+        assert_eq!(
+            parse("pipep -t %1"),
+            TmuxCliCommand::PipePane {
+                target: Some("%1".into()),
+                command: None,
+            }
+        );
+    }
+
+    #[test]
+    fn phase17_display_popup_basic() {
+        assert_eq!(
+            parse("display-popup -t %0"),
+            TmuxCliCommand::DisplayPopup {
+                target: Some("%0".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn phase17_popup_alias() {
+        assert_eq!(
+            parse("popup -E ls"),
+            TmuxCliCommand::DisplayPopup { target: None }
+        );
+    }
+
+    #[test]
+    fn phase17_display_popup_with_flags() {
+        assert_eq!(
+            parse("display-popup -w 80 -h 24 -d /tmp -t %2 echo hello"),
+            TmuxCliCommand::DisplayPopup {
+                target: Some("%2".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn phase17_run_shell_basic() {
+        assert_eq!(
+            parse("run-shell \"echo hello\""),
+            TmuxCliCommand::RunShell {
+                background: false,
+                target: None,
+                command: Some("echo hello".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn phase17_run_shell_background() {
+        assert_eq!(
+            parse("run-shell -b \"sleep 1\""),
+            TmuxCliCommand::RunShell {
+                background: true,
+                target: None,
+                command: Some("sleep 1".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn phase17_run_shell_with_target() {
+        assert_eq!(
+            parse("run-shell -t %5 \"echo hi\""),
+            TmuxCliCommand::RunShell {
+                background: false,
+                target: Some("%5".into()),
+                command: Some("echo hi".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn phase17_run_alias() {
+        assert_eq!(
+            parse("run \"date\""),
+            TmuxCliCommand::RunShell {
+                background: false,
+                target: None,
+                command: Some("date".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn phase17_run_shell_no_command() {
+        assert_eq!(
+            parse("run-shell"),
+            TmuxCliCommand::RunShell {
+                background: false,
+                target: None,
+                command: None,
+            }
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 18: robustness & edge case tests
+    // ---------------------------------------------------------------
+
+    // 18.2: send-keys with special characters
+
+    #[test]
+    fn phase18_send_keys_literal_with_special_chars() {
+        // Quotes, backslashes, dollar signs in literal mode
+        // shell_words::split unquotes: "echo $HOME" -> echo $HOME
+        assert_eq!(
+            parse(r#"send-keys -t %3 -l "echo $HOME done""#),
+            TmuxCliCommand::SendKeys {
+                target: Some("%3".into()),
+                literal: true,
+                hex: false,
+                keys: vec!["echo $HOME done".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn phase18_send_keys_env_syntax() {
+        // env VAR=value command syntax used by Claude Code
+        assert_eq!(
+            parse("send-keys -t %5 \"cd /path && env CLAUDECODE=1 claude --agent\" C-m"),
+            TmuxCliCommand::SendKeys {
+                target: Some("%5".into()),
+                literal: false,
+                hex: false,
+                keys: vec![
+                    "cd /path && env CLAUDECODE=1 claude --agent".into(),
+                    "C-m".into(),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn phase18_send_keys_named_control_keys() {
+        // C-c, C-d, C-z named keys
+        assert_eq!(
+            parse("send-keys -t %0 C-c"),
+            TmuxCliCommand::SendKeys {
+                target: Some("%0".into()),
+                literal: false,
+                hex: false,
+                keys: vec!["C-c".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn phase18_send_keys_multiple_named_keys() {
+        assert_eq!(
+            parse("send-keys -t %1 Escape \"[A\""),
+            TmuxCliCommand::SendKeys {
+                target: Some("%1".into()),
+                literal: false,
+                hex: false,
+                keys: vec!["Escape".into(), "[A".into()],
+            }
+        );
+    }
+
+    // 18.3: unknown command returns parse error
+
+    #[test]
+    fn phase18_unknown_command_error() {
+        let result = parse_command("frobnicate --everything");
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("unknown"),
+            "error should mention 'unknown': {}",
+            err
+        );
+    }
+
+    #[test]
+    fn phase18_empty_command_error() {
+        assert!(parse_command("").is_err());
+        assert!(parse_command("   ").is_err());
+    }
+
+    // 18.4: -c flag stored in spawn commands
+
+    #[test]
+    fn phase18_split_window_cwd() {
+        assert_eq!(
+            parse("split-window -h -c /home/user/project"),
+            TmuxCliCommand::SplitWindow {
+                horizontal: true,
+                vertical: false,
+                target: None,
+                size: None,
+                print_and_format: None,
+                cwd: Some("/home/user/project".into()),
+                env: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn phase18_new_window_cwd() {
+        assert_eq!(
+            parse("new-window -c /tmp -n build"),
+            TmuxCliCommand::NewWindow {
+                target: None,
+                name: Some("build".into()),
+                print_and_format: None,
+                cwd: Some("/tmp".into()),
+                env: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn phase18_new_session_cwd() {
+        assert_eq!(
+            parse("new-session -s work -c /home/user"),
+            TmuxCliCommand::NewSession {
+                name: Some("work".into()),
+                window_name: None,
+                detached: false,
+                print_and_format: None,
+                cwd: Some("/home/user".into()),
+                env: vec![],
+            }
+        );
+    }
+
+    // 18.5: -e flag stored in spawn commands
+
+    #[test]
+    fn phase18_split_window_env() {
+        assert_eq!(
+            parse("split-window -h -e CLAUDECODE=1 -e TERM=xterm"),
+            TmuxCliCommand::SplitWindow {
+                horizontal: true,
+                vertical: false,
+                target: None,
+                size: None,
+                print_and_format: None,
+                cwd: None,
+                env: vec!["CLAUDECODE=1".into(), "TERM=xterm".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn phase18_new_window_env() {
+        assert_eq!(
+            parse("new-window -e FOO=bar"),
+            TmuxCliCommand::NewWindow {
+                target: None,
+                name: None,
+                print_and_format: None,
+                cwd: None,
+                env: vec!["FOO=bar".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn phase18_split_window_cwd_and_env() {
+        // Combined -c and -e flags
+        assert_eq!(
+            parse("split-window -h -c /tmp -e KEY=val -P -F '#{pane_id}'"),
+            TmuxCliCommand::SplitWindow {
+                horizontal: true,
+                vertical: false,
+                target: None,
+                size: None,
+                print_and_format: Some("#{pane_id}".into()),
+                cwd: Some("/tmp".into()),
+                env: vec!["KEY=val".into()],
+            }
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 19: diagnostic & debugging tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn phase19_server_info() {
+        assert_eq!(parse("server-info"), TmuxCliCommand::ServerInfo);
+    }
+
+    #[test]
+    fn phase19_info_alias() {
+        assert_eq!(parse("info"), TmuxCliCommand::ServerInfo);
+    }
+
+    #[test]
+    fn phase19_display_message_verbose() {
+        assert_eq!(
+            parse("display-message -v -p '#{pane_id}'"),
+            TmuxCliCommand::DisplayMessage {
+                print: true,
+                verbose: true,
+                format: Some("#{pane_id}".into()),
+                target: None,
+            }
+        );
+    }
+
+    #[test]
+    fn phase19_display_message_no_verbose() {
+        assert_eq!(
+            parse("display-message -p '#{session_name}'"),
+            TmuxCliCommand::DisplayMessage {
+                print: true,
+                verbose: false,
+                format: Some("#{session_name}".into()),
+                target: None,
             }
         );
     }

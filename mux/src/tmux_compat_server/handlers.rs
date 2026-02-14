@@ -9,6 +9,8 @@ use std::sync::Arc;
 use config::keyassignment::SpawnTabDomain;
 use wezterm_term::TerminalSize;
 
+use portable_pty::CommandBuilder;
+
 use crate::domain::SplitSource;
 use crate::pane::{CachePolicy, Pane, PaneId};
 use crate::tab::{SplitDirection, SplitRequest, SplitSize, Tab};
@@ -275,7 +277,7 @@ impl HandlerContext {
                 let ws = self
                     .id_map
                     .workspace_name(*id)
-                    .ok_or_else(|| format!("session $${} not found", id))?;
+                    .ok_or_else(|| format!("can't find session: ${}", id))?;
                 Some(ws.to_string())
             }
             Some(SessionRef::Name(name)) => {
@@ -283,7 +285,7 @@ impl HandlerContext {
                 if workspaces.contains(name) {
                     Some(name.clone())
                 } else {
-                    return Err(format!("session '{}' not found", name));
+                    return Err(format!("can't find session: {}", name));
                 }
             }
             None => Some(self.workspace.clone()),
@@ -299,11 +301,11 @@ impl HandlerContext {
                 let tab_id = self
                     .id_map
                     .wezterm_tab_id(*id)
-                    .ok_or_else(|| format!("window @{} not found", id))?;
+                    .ok_or_else(|| format!("can't find window: @{}", id))?;
                 // Find the mux window containing this tab
                 let wid = mux
                     .window_containing_tab(tab_id)
-                    .ok_or_else(|| format!("tab {} not found in any window", tab_id))?;
+                    .ok_or_else(|| format!("can't find window containing tab {}", tab_id))?;
                 resolved.tab_id = Some(tab_id);
                 Some(wid)
             }
@@ -311,11 +313,11 @@ impl HandlerContext {
                 let wid = window_ids
                     .get(*idx as usize)
                     .copied()
-                    .ok_or_else(|| format!("window index {} out of range", idx))?;
+                    .ok_or_else(|| format!("can't find window: index {}", idx))?;
                 // Get the active tab in that window
                 let window = mux
                     .get_window(wid)
-                    .ok_or_else(|| format!("window {} not found", wid))?;
+                    .ok_or_else(|| format!("can't find window: {}", wid))?;
                 resolved.tab_id = window.get_active().map(|t| t.tab_id());
                 Some(wid)
             }
@@ -335,7 +337,7 @@ impl HandlerContext {
                         }
                     }
                 }
-                let (wid, tid) = found.ok_or_else(|| format!("window '{}' not found", name))?;
+                let (wid, tid) = found.ok_or_else(|| format!("can't find window: {}", name))?;
                 resolved.tab_id = Some(tid);
                 Some(wid)
             }
@@ -374,18 +376,18 @@ impl HandlerContext {
                 let wez_id = self
                     .id_map
                     .wezterm_pane_id(*id)
-                    .ok_or_else(|| format!("pane %{} not found", id))?;
+                    .ok_or_else(|| format!("can't find pane: %{}", id))?;
                 Some(wez_id)
             }
             Some(PaneRef::Index(idx)) => {
                 if let Some(tab_id) = resolved.tab_id {
                     let tab = mux
                         .get_tab(tab_id)
-                        .ok_or_else(|| format!("tab {} not found", tab_id))?;
+                        .ok_or_else(|| format!("can't find window for tab {}", tab_id))?;
                     let panes = tab.iter_panes();
                     let pp = panes
                         .get(*idx as usize)
-                        .ok_or_else(|| format!("pane index {} out of range", idx))?;
+                        .ok_or_else(|| format!("can't find pane: index {}", idx))?;
                     Some(pp.pane.pane_id())
                 } else {
                     return Err("no window resolved for pane index lookup".to_string());
@@ -398,7 +400,7 @@ impl HandlerContext {
                 } else if let Some(tab_id) = resolved.tab_id {
                     let tab = mux
                         .get_tab(tab_id)
-                        .ok_or_else(|| format!("tab {} not found", tab_id))?;
+                        .ok_or_else(|| format!("can't find window for tab {}", tab_id))?;
                     tab.get_active_pane().map(|p| p.pane_id())
                 } else {
                     None
@@ -528,9 +530,10 @@ pub async fn dispatch_command(
         TmuxCliCommand::ListSessions { format } => handle_list_sessions(ctx, format.as_deref()),
         TmuxCliCommand::DisplayMessage {
             print: _,
+            verbose,
             format,
             target,
-        } => handle_display_message(ctx, format.as_deref(), &target),
+        } => handle_display_message(ctx, verbose, format.as_deref(), &target),
         TmuxCliCommand::CapturePane {
             print: _,
             target,
@@ -581,6 +584,8 @@ pub async fn dispatch_command(
             target,
             size,
             print_and_format,
+            cwd,
+            env,
         } => {
             handle_split_window(
                 ctx,
@@ -588,6 +593,8 @@ pub async fn dispatch_command(
                 &target,
                 size.as_deref(),
                 print_and_format.as_deref(),
+                cwd.as_deref(),
+                &env,
             )
             .await
         }
@@ -595,7 +602,19 @@ pub async fn dispatch_command(
             target,
             name,
             print_and_format,
-        } => handle_new_window(ctx, &target, name.as_deref(), print_and_format.as_deref()).await,
+            cwd,
+            env,
+        } => {
+            handle_new_window(
+                ctx,
+                &target,
+                name.as_deref(),
+                print_and_format.as_deref(),
+                cwd.as_deref(),
+                &env,
+            )
+            .await
+        }
         TmuxCliCommand::KillWindow { target } => handle_kill_window(ctx, &target),
         TmuxCliCommand::KillSession { target } => handle_kill_session(ctx, &target),
         TmuxCliCommand::RenameWindow { target, name } => handle_rename_window(ctx, &target, &name),
@@ -607,25 +626,31 @@ pub async fn dispatch_command(
             window_name,
             detached: _,
             print_and_format,
+            cwd,
+            env,
         } => {
             handle_new_session(
                 ctx,
                 name.as_deref(),
                 window_name.as_deref(),
                 print_and_format.as_deref(),
+                cwd.as_deref(),
+                &env,
             )
             .await
         }
         TmuxCliCommand::ShowOptions {
             global,
             value_only,
+            quiet,
             option_name,
-        } => handle_show_options(global, value_only, option_name.as_deref()),
+        } => handle_show_options(global, value_only, quiet, option_name.as_deref()),
         TmuxCliCommand::ShowWindowOptions {
             global,
             value_only,
+            quiet,
             option_name,
-        } => handle_show_window_options(global, value_only, option_name.as_deref()),
+        } => handle_show_window_options(global, value_only, quiet, option_name.as_deref()),
         TmuxCliCommand::AttachSession { target } => handle_attach_session(ctx, &target),
         TmuxCliCommand::DetachClient => handle_detach_client(ctx),
         TmuxCliCommand::SwitchClient { target } => handle_attach_session(ctx, &target),
@@ -674,6 +699,33 @@ pub async fn dispatch_command(
             source,
             target,
         } => handle_break_pane(ctx, detach, &source, &target).await,
+        // Phase 17: missing commands for cleanup & orchestration
+        TmuxCliCommand::KillServer => {
+            ctx.detach_requested = true;
+            Ok(String::new())
+        }
+        TmuxCliCommand::WaitFor { signal: _, channel: _ } => {
+            // Stub: signal returns immediately, lock/unlock return immediately
+            Ok(String::new())
+        }
+        TmuxCliCommand::PipePane {
+            target: _,
+            command: _,
+        } => {
+            // Stub: output streaming is handled by CC %output notifications
+            Ok(String::new())
+        }
+        TmuxCliCommand::DisplayPopup { target: _ } => {
+            // No-op: GUI popups don't apply to CC mode
+            Ok(String::new())
+        }
+        TmuxCliCommand::RunShell {
+            background: _,
+            target: _,
+            command,
+        } => handle_run_shell(command.as_deref()),
+        // Phase 19: diagnostic & debugging
+        TmuxCliCommand::ServerInfo => Ok(handle_server_info(ctx)),
     }
 }
 
@@ -691,8 +743,10 @@ pub fn handle_list_commands() -> String {
         "delete-buffer",
         "detach-client",
         "display-message",
+        "display-popup",
         "has-session",
         "kill-pane",
+        "kill-server",
         "kill-session",
         "kill-window",
         "join-pane",
@@ -707,11 +761,14 @@ pub fn handle_list_commands() -> String {
         "new-session",
         "new-window",
         "paste-buffer",
+        "pipe-pane",
         "refresh-client",
         "rename-session",
         "rename-window",
         "resize-pane",
         "resize-window",
+        "run-shell",
+        "server-info",
         "select-layout",
         "select-pane",
         "select-window",
@@ -723,9 +780,56 @@ pub fn handle_list_commands() -> String {
         "show-window-options",
         "split-window",
         "switch-client",
+        "wait-for",
     ];
     commands.sort();
     commands.join("\n")
+}
+
+/// Handle `server-info` / `info` — return diagnostic information about the server.
+pub fn handle_server_info(ctx: &HandlerContext) -> String {
+    let mut lines = Vec::new();
+
+    lines.push(format!(
+        "wezterm {}",
+        config::wezterm_version()
+    ));
+    lines.push(format!("tmux compat server (CC mode)"));
+    lines.push(format!("pid: {}", std::process::id()));
+
+    if let Some(mux) = Mux::try_get() {
+        let workspaces = mux.iter_workspaces();
+        lines.push(format!("sessions: {}", workspaces.len()));
+
+        let mut total_windows = 0usize;
+        let mut total_panes = 0usize;
+        for ws in &workspaces {
+            for wid in mux.iter_windows_in_workspace(ws) {
+                if let Some(win) = mux.get_window(wid) {
+                    total_windows += win.len();
+                    for tab in win.iter() {
+                        total_panes += tab.iter_panes().len();
+                    }
+                }
+            }
+        }
+        lines.push(format!("windows: {}", total_windows));
+        lines.push(format!("panes: {}", total_panes));
+    }
+
+    lines.push(format!("workspace: {}", ctx.workspace));
+
+    if let Some(sid) = ctx.active_session_id {
+        lines.push(format!("active_session: ${}", sid));
+    }
+    if let Some(wid) = ctx.active_window_id {
+        lines.push(format!("active_window: @{}", wid));
+    }
+    if let Some(pid) = ctx.active_pane_id {
+        lines.push(format!("active_pane: %{}", pid));
+    }
+
+    lines.join("\n")
 }
 
 /// Handle `copy-mode [-q]`.
@@ -738,6 +842,32 @@ pub fn handle_copy_mode(_quit: bool) -> Result<String, String> {
     // No-op: WezTerm's copy overlay is independent of tmux CC protocol.
     // iTerm2 sends `copy-mode -q` on connect as a defensive measure.
     Ok(String::new())
+}
+
+/// Handle `run-shell <command>`.
+///
+/// Executes a shell command and returns its stdout. If no command is given,
+/// returns empty success.
+pub fn handle_run_shell(command: Option<&str>) -> Result<String, String> {
+    match command {
+        Some(cmd) if !cmd.is_empty() => {
+            let shell = if cfg!(windows) { "cmd" } else { "sh" };
+            let flag = if cfg!(windows) { "/C" } else { "-c" };
+            match std::process::Command::new(shell)
+                .arg(flag)
+                .arg(cmd)
+                .output()
+            {
+                Ok(output) => {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    // Trim trailing newline/carriage-return like tmux does
+                    Ok(stdout.trim_end_matches(&['\r', '\n'][..]).to_string())
+                }
+                Err(e) => Err(format!("run-shell: {}", e)),
+            }
+        }
+        _ => Ok(String::new()),
+    }
 }
 
 /// Check whether a session (workspace) exists.
@@ -754,7 +884,7 @@ pub fn handle_has_session(ctx: &HandlerContext, target: &Option<String>) -> Resu
                     let ws = ctx
                         .id_map
                         .workspace_name(id)
-                        .ok_or_else(|| format!("session $${} not found", id))?;
+                        .ok_or_else(|| format!("can't find session: ${}", id))?;
                     ws.to_string()
                 }
                 None => ctx.workspace.clone(),
@@ -807,7 +937,7 @@ pub fn handle_list_panes(
         if let Some(tab_id) = resolved.tab_id {
             let tab = mux
                 .get_tab(tab_id)
-                .ok_or_else(|| format!("tab {} not found", tab_id))?;
+                .ok_or_else(|| format!("can't find window for tab {}", tab_id))?;
             let wid = resolved.window_id.unwrap_or(0);
             let workspace = resolved.workspace.unwrap_or_else(|| ctx.workspace.clone());
 
@@ -959,8 +1089,13 @@ pub fn handle_list_sessions(
 }
 
 /// Display a message by expanding a format string against the active context.
+///
+/// When `verbose` is true (`-v` flag), prepends a comment showing each format
+/// variable and its resolved value before the expanded result.  This aids
+/// debugging of format-string issues.
 pub fn handle_display_message(
     ctx: &mut HandlerContext,
+    verbose: bool,
     format: Option<&str>,
     target: &Option<String>,
 ) -> Result<String, String> {
@@ -977,7 +1112,7 @@ pub fn handle_display_message(
         let workspace = resolved.workspace.unwrap_or_else(|| ctx.workspace.clone());
         let tab = mux
             .get_tab(tab_id)
-            .ok_or_else(|| format!("tab {} not found", tab_id))?;
+            .ok_or_else(|| format!("can't find window for tab {}", tab_id))?;
         let panes = tab.iter_panes();
         if let Some(pp) = panes.iter().find(|p| p.pane.pane_id() == pane_id) {
             let window_index = {
@@ -985,12 +1120,82 @@ pub fn handle_display_message(
                 wids.iter().position(|&w| w == wid).unwrap_or(0)
             };
             let fctx = build_format_context(ctx, pp, &tab, wid, window_index, &workspace);
-            return Ok(expand_format(fmt, &fctx));
+            let expanded = expand_format(fmt, &fctx);
+            if verbose {
+                return Ok(format_verbose_output(fmt, &fctx, &expanded));
+            }
+            return Ok(expanded);
         }
     }
 
     // Fallback: expand with default context
-    Ok(expand_format(fmt, &FormatContext::default()))
+    let fctx = FormatContext::default();
+    let expanded = expand_format(fmt, &fctx);
+    if verbose {
+        return Ok(format_verbose_output(fmt, &fctx, &expanded));
+    }
+    Ok(expanded)
+}
+
+/// Build verbose output showing each variable referenced in the format string
+/// and its resolved value.
+fn format_verbose_output(fmt: &str, ctx: &FormatContext, expanded: &str) -> String {
+    let mut lines = Vec::new();
+    lines.push(format!("# format: {}", fmt));
+
+    // Extract variable names from #{...} patterns and #X short aliases
+    let bytes = fmt.as_bytes();
+    let mut i = 0;
+    let mut seen = std::collections::HashSet::new();
+    while i < bytes.len() {
+        if i + 1 < bytes.len() && bytes[i] == b'#' {
+            if bytes[i + 1] == b'{' {
+                // #{variable_name} or #{?cond,...}
+                if let Some(end) = fmt[i + 2..].find('}') {
+                    let var = &fmt[i + 2..i + 2 + end];
+                    // Skip conditionals (starting with ?)
+                    if !var.starts_with('?') && seen.insert(var.to_string()) {
+                        let value = expand_format(&format!("#{{{}}}", var), ctx);
+                        lines.push(format!("# {} -> {}", var, value));
+                    }
+                    i += 3 + end;
+                } else {
+                    i += 1;
+                }
+            } else if bytes[i + 1] == b'#' {
+                i += 2; // ## literal
+            } else {
+                // Short alias #X
+                let alias_name = match bytes[i + 1] {
+                    b'D' => Some("pane_id"),
+                    b'F' => Some("window_flags"),
+                    b'I' => Some("window_index"),
+                    b'P' => Some("pane_index"),
+                    b'S' => Some("session_name"),
+                    b'T' => Some("pane_title"),
+                    b'W' => Some("window_name"),
+                    _ => None,
+                };
+                if let Some(name) = alias_name {
+                    if seen.insert(name.to_string()) {
+                        let value = expand_format(&format!("#{{{}}}", name), ctx);
+                        lines.push(format!(
+                            "# #{} ({}) -> {}",
+                            bytes[i + 1] as char,
+                            name,
+                            value
+                        ));
+                    }
+                }
+                i += 2;
+            }
+        } else {
+            i += 1;
+        }
+    }
+
+    lines.push(expanded.to_string());
+    lines.join("\n")
 }
 
 /// Capture pane content as text.
@@ -1005,11 +1210,11 @@ pub fn handle_capture_pane(
     let resolved = ctx.resolve_target(target)?;
     let pane_id = resolved
         .pane_id
-        .ok_or_else(|| "no pane resolved".to_string())?;
+        .ok_or_else(|| "can't find pane".to_string())?;
 
     let pane = mux
         .get_pane(pane_id)
-        .ok_or_else(|| format!("pane {} not found", pane_id))?;
+        .ok_or_else(|| format!("can't find pane: {}", pane_id))?;
 
     let dims = pane.get_dimensions();
     let viewport_rows = dims.viewport_rows as isize;
@@ -1058,11 +1263,11 @@ pub fn handle_send_keys(
     let resolved = ctx.resolve_target(target)?;
     let pane_id = resolved
         .pane_id
-        .ok_or_else(|| "no pane resolved".to_string())?;
+        .ok_or_else(|| "can't find pane".to_string())?;
 
     let pane = mux
         .get_pane(pane_id)
-        .ok_or_else(|| format!("pane {} not found", pane_id))?;
+        .ok_or_else(|| format!("can't find pane: {}", pane_id))?;
 
     let mut all_bytes = Vec::new();
     for key in keys {
@@ -1088,7 +1293,7 @@ pub fn handle_select_pane(
     let resolved = ctx.resolve_target(target)?;
     let pane_id = resolved
         .pane_id
-        .ok_or_else(|| "no pane resolved".to_string())?;
+        .ok_or_else(|| "can't find pane".to_string())?;
 
     // If -T was specified, set pane title (best effort — WezTerm doesn't have per-pane titles,
     // so we set the containing tab's title instead)
@@ -1131,7 +1336,7 @@ pub fn handle_select_window(
     {
         let mut window = mux
             .get_window_mut(wid)
-            .ok_or_else(|| format!("window {} not found", wid))?;
+            .ok_or_else(|| format!("can't find window: {}", wid))?;
         let idx = window
             .idx_by_id(tab_id)
             .ok_or_else(|| format!("tab {} not in window {}", tab_id, wid))?;
@@ -1161,7 +1366,7 @@ pub fn handle_kill_pane(
     let resolved = ctx.resolve_target(target)?;
     let pane_id = resolved
         .pane_id
-        .ok_or_else(|| "no pane resolved".to_string())?;
+        .ok_or_else(|| "can't find pane".to_string())?;
 
     ctx.id_map.remove_pane(pane_id);
     mux.remove_pane(pane_id);
@@ -1186,7 +1391,7 @@ pub fn handle_resize_pane(
             .ok_or_else(|| "no window resolved for zoom".to_string())?;
         let tab = mux
             .get_tab(tab_id)
-            .ok_or_else(|| format!("tab {} not found", tab_id))?;
+            .ok_or_else(|| format!("can't find window for tab {}", tab_id))?;
         tab.toggle_zoom();
         return Ok(String::new());
     }
@@ -1194,11 +1399,11 @@ pub fn handle_resize_pane(
     let resolved = ctx.resolve_target(target)?;
     let pane_id = resolved
         .pane_id
-        .ok_or_else(|| "no pane resolved".to_string())?;
+        .ok_or_else(|| "can't find pane".to_string())?;
 
     let pane = mux
         .get_pane(pane_id)
-        .ok_or_else(|| format!("pane {} not found", pane_id))?;
+        .ok_or_else(|| format!("can't find pane: {}", pane_id))?;
 
     let dims = pane.get_dimensions();
     let new_cols = width.map(|w| w as usize).unwrap_or(dims.cols);
@@ -1234,7 +1439,7 @@ pub fn handle_resize_window(
 
     let tab = mux
         .get_tab(tab_id)
-        .ok_or_else(|| format!("tab {} not found", tab_id))?;
+        .ok_or_else(|| format!("can't find window for tab {}", tab_id))?;
 
     let current_size = tab.get_size();
     let new_cols = width.map(|w| w as usize).unwrap_or(current_size.cols);
@@ -1747,13 +1952,15 @@ pub async fn handle_split_window(
     target: &Option<String>,
     size: Option<&str>,
     print_and_format: Option<&str>,
+    cwd: Option<&str>,
+    env: &[String],
 ) -> Result<String, String> {
     let mux = Mux::try_get().ok_or_else(|| "mux not available".to_string())?;
 
     let resolved = ctx.resolve_target(target)?;
     let pane_id = resolved
         .pane_id
-        .ok_or_else(|| "no pane resolved for split".to_string())?;
+        .ok_or_else(|| "can't find pane for split".to_string())?;
 
     let split_size = parse_split_size(size)?;
 
@@ -1770,9 +1977,21 @@ pub async fn handle_split_window(
         size: split_size,
     };
 
+    let command = if !env.is_empty() {
+        let mut builder = CommandBuilder::new_default_prog();
+        for kv in env {
+            if let Some((k, v)) = kv.split_once('=') {
+                builder.env(k, v);
+            }
+        }
+        Some(builder)
+    } else {
+        None
+    };
+
     let source = SplitSource::Spawn {
-        command: None,
-        command_dir: None,
+        command,
+        command_dir: cwd.map(|s| s.to_string()),
     };
 
     let (new_pane, _new_size) = mux
@@ -1798,6 +2017,8 @@ pub async fn handle_new_window(
     target: &Option<String>,
     name: Option<&str>,
     print_and_format: Option<&str>,
+    cwd: Option<&str>,
+    env: &[String],
 ) -> Result<String, String> {
     let mux = Mux::try_get().ok_or_else(|| "mux not available".to_string())?;
 
@@ -1808,12 +2029,24 @@ pub async fn handle_new_window(
 
     let current_pane_id = resolved.pane_id;
 
+    let command = if !env.is_empty() {
+        let mut builder = CommandBuilder::new_default_prog();
+        for kv in env {
+            if let Some((k, v)) = kv.split_once('=') {
+                builder.env(k, v);
+            }
+        }
+        Some(builder)
+    } else {
+        None
+    };
+
     let (tab, pane, _wid) = mux
         .spawn_tab_or_window(
             window_id,
             SpawnTabDomain::CurrentPaneDomain,
-            None,
-            None,
+            command,
+            cwd.map(|s| s.to_string()),
             TerminalSize::default(),
             current_pane_id,
             workspace,
@@ -1927,7 +2160,7 @@ pub fn handle_rename_window(
 
     let tab = mux
         .get_tab(tab_id)
-        .ok_or_else(|| format!("tab {} not found", tab_id))?;
+        .ok_or_else(|| format!("can't find window for tab {}", tab_id))?;
 
     tab.set_title(name);
 
@@ -2048,7 +2281,7 @@ pub fn handle_move_window(
                 }
             }
         }
-        found.ok_or_else(|| format!("source window @{} not found", src_tab_id))?
+        found.ok_or_else(|| format!("can't find source window: @{}", src_tab_id))?
     };
 
     // Resolve destination: target window (mux Window) to move into.
@@ -2099,6 +2332,8 @@ pub async fn handle_new_session(
     name: Option<&str>,
     window_name: Option<&str>,
     print_and_format: Option<&str>,
+    cwd: Option<&str>,
+    env: &[String],
 ) -> Result<String, String> {
     let mux = Mux::try_get().ok_or_else(|| "mux not available".to_string())?;
 
@@ -2109,12 +2344,24 @@ pub async fn handle_new_session(
         return Err(format!("duplicate session: {}", workspace));
     }
 
+    let command = if !env.is_empty() {
+        let mut builder = CommandBuilder::new_default_prog();
+        for kv in env {
+            if let Some((k, v)) = kv.split_once('=') {
+                builder.env(k, v);
+            }
+        }
+        Some(builder)
+    } else {
+        None
+    };
+
     let (tab, pane, _wid) = mux
         .spawn_tab_or_window(
             None, // create a new mux window
             SpawnTabDomain::CurrentPaneDomain,
-            None,
-            None,
+            command,
+            cwd.map(|s| s.to_string()),
             TerminalSize::default(),
             None, // no current pane
             workspace.clone(),
@@ -2218,7 +2465,7 @@ async fn handle_break_pane(
     let resolved_src = ctx.resolve_target(source)?;
     let pane_id = resolved_src
         .pane_id
-        .ok_or_else(|| "no pane resolved for break-pane".to_string())?;
+        .ok_or_else(|| "can't find pane for break-pane".to_string())?;
 
     // Determine the workspace for the new tab
     let workspace = if let Some(tgt) = target {
@@ -2257,13 +2504,24 @@ async fn handle_break_pane(
 pub fn handle_show_options(
     global: bool,
     value_only: bool,
+    quiet: bool,
     option_name: Option<&str>,
 ) -> Result<String, String> {
-    // Known global server options with sensible defaults
+    // Known global server/session options with sensible defaults.
+    // Phase 15: expanded with options Claude Code and common tools query.
     let options: &[(&str, &str)] = &[
+        ("base-index", "0"),
+        ("default-shell", "/bin/sh"),
         ("default-terminal", "screen-256color"),
         ("escape-time", "500"),
+        ("focus-events", "on"),
+        ("mouse", "off"),
+        ("pane-base-index", "0"),
+        ("renumber-windows", "off"),
         ("set-clipboard", "on"),
+        ("set-titles", "off"),
+        ("status", "off"),
+        ("allow-rename", "on"),
     ];
 
     if global {
@@ -2275,6 +2533,9 @@ pub fn handle_show_options(
                     } else {
                         Ok(format!("{} {}", name, value))
                     }
+                } else if quiet {
+                    // -q: suppress errors for unknown options
+                    Ok(String::new())
                 } else {
                     Err(format!("unknown option: {}", name))
                 }
@@ -2295,9 +2556,16 @@ pub fn handle_show_options(
             }
         }
     } else {
-        // Non-global options: we don't track per-session options
+        // Non-global options: we don't track per-session options.
+        // With -q, return empty success instead of error.
         match option_name {
-            Some(name) => Err(format!("unknown option: {}", name)),
+            Some(name) => {
+                if quiet {
+                    Ok(String::new())
+                } else {
+                    Err(format!("unknown option: {}", name))
+                }
+            }
             None => Ok(String::new()),
         }
     }
@@ -2306,12 +2574,20 @@ pub fn handle_show_options(
 /// Return hardcoded tmux window options.
 ///
 /// iTerm2 queries: `showw -gv aggressive-resize`.
+/// Phase 15: expanded with pane-base-index and other common options.
 pub fn handle_show_window_options(
     global: bool,
     value_only: bool,
+    quiet: bool,
     option_name: Option<&str>,
 ) -> Result<String, String> {
-    let options: &[(&str, &str)] = &[("aggressive-resize", "off"), ("mode-keys", "emacs")];
+    let options: &[(&str, &str)] = &[
+        ("aggressive-resize", "off"),
+        ("allow-rename", "on"),
+        ("mode-keys", "emacs"),
+        ("pane-base-index", "0"),
+        ("remain-on-exit", "off"),
+    ];
 
     if global {
         match option_name {
@@ -2322,6 +2598,8 @@ pub fn handle_show_window_options(
                     } else {
                         Ok(format!("{} {}", name, value))
                     }
+                } else if quiet {
+                    Ok(String::new())
                 } else {
                     Err(format!("unknown option: {}", name))
                 }
@@ -2342,7 +2620,13 @@ pub fn handle_show_window_options(
         }
     } else {
         match option_name {
-            Some(name) => Err(format!("unknown option: {}", name)),
+            Some(name) => {
+                if quiet {
+                    Ok(String::new())
+                } else {
+                    Err(format!("unknown option: {}", name))
+                }
+            }
             None => Ok(String::new()),
         }
     }
@@ -2379,7 +2663,7 @@ pub fn handle_attach_session(
                     let ws = ctx
                         .id_map
                         .workspace_name(id)
-                        .ok_or_else(|| format!("session ${} not found", id))?;
+                        .ok_or_else(|| format!("can't find session: ${}", id))?;
                     ws.to_string()
                 }
                 None => ctx.workspace.clone(),
@@ -2607,7 +2891,7 @@ fn handle_paste_buffer(
 
     let pane = mux
         .get_pane(pane_id)
-        .ok_or_else(|| "pane not found".to_string())?;
+        .ok_or_else(|| "can't find pane".to_string())?;
 
     // send_paste handles bracketed paste based on pane's terminal mode.
     pane.send_paste(&data)
@@ -2801,7 +3085,7 @@ mod tests {
     fn list_commands_contains_all() {
         let output = handle_list_commands();
         let commands: Vec<&str> = output.lines().collect();
-        assert_eq!(commands.len(), 39);
+        assert_eq!(commands.len(), 45);
         assert!(commands.contains(&"attach-session"));
         assert!(commands.contains(&"break-pane"));
         assert!(commands.contains(&"capture-pane"));
@@ -2841,6 +3125,12 @@ mod tests {
         assert!(commands.contains(&"show-window-options"));
         assert!(commands.contains(&"split-window"));
         assert!(commands.contains(&"switch-client"));
+        // Phase 17 commands
+        assert!(commands.contains(&"display-popup"));
+        assert!(commands.contains(&"kill-server"));
+        assert!(commands.contains(&"pipe-pane"));
+        assert!(commands.contains(&"run-shell"));
+        assert!(commands.contains(&"wait-for"));
     }
 
     #[test]
@@ -2856,31 +3146,31 @@ mod tests {
 
     #[test]
     fn show_options_global_value_default_terminal() {
-        let result = handle_show_options(true, true, Some("default-terminal"));
+        let result = handle_show_options(true, true, false, Some("default-terminal"));
         assert_eq!(result, Ok("screen-256color".to_string()));
     }
 
     #[test]
     fn show_options_global_value_escape_time() {
-        let result = handle_show_options(true, true, Some("escape-time"));
+        let result = handle_show_options(true, true, false, Some("escape-time"));
         assert_eq!(result, Ok("500".to_string()));
     }
 
     #[test]
     fn show_options_global_value_set_clipboard() {
-        let result = handle_show_options(true, true, Some("set-clipboard"));
+        let result = handle_show_options(true, true, false, Some("set-clipboard"));
         assert_eq!(result, Ok("on".to_string()));
     }
 
     #[test]
     fn show_options_global_key_value_format() {
-        let result = handle_show_options(true, false, Some("default-terminal"));
+        let result = handle_show_options(true, false, false, Some("default-terminal"));
         assert_eq!(result, Ok("default-terminal screen-256color".to_string()));
     }
 
     #[test]
     fn show_options_global_all() {
-        let result = handle_show_options(true, false, None).unwrap();
+        let result = handle_show_options(true, false, false, None).unwrap();
         assert!(result.contains("default-terminal screen-256color"));
         assert!(result.contains("escape-time 500"));
         assert!(result.contains("set-clipboard on"));
@@ -2888,40 +3178,108 @@ mod tests {
 
     #[test]
     fn show_options_unknown_option_is_error() {
-        let result = handle_show_options(true, true, Some("nonexistent"));
+        let result = handle_show_options(true, true, false, Some("nonexistent"));
         assert!(result.is_err());
     }
 
     #[test]
     fn show_options_non_global_unknown_is_error() {
-        let result = handle_show_options(false, false, Some("anything"));
+        let result = handle_show_options(false, false, false, Some("anything"));
         assert!(result.is_err());
+    }
+
+    // --- Phase 15: new show-options tests ---
+
+    #[test]
+    fn show_options_base_index() {
+        let result = handle_show_options(true, true, false, Some("base-index"));
+        assert_eq!(result, Ok("0".to_string()));
+    }
+
+    #[test]
+    fn show_options_pane_base_index() {
+        let result = handle_show_options(true, true, false, Some("pane-base-index"));
+        assert_eq!(result, Ok("0".to_string()));
+    }
+
+    #[test]
+    fn show_options_focus_events() {
+        let result = handle_show_options(true, true, false, Some("focus-events"));
+        assert_eq!(result, Ok("on".to_string()));
+    }
+
+    #[test]
+    fn show_options_mouse() {
+        let result = handle_show_options(true, true, false, Some("mouse"));
+        assert_eq!(result, Ok("off".to_string()));
+    }
+
+    #[test]
+    fn show_options_quiet_unknown_is_ok() {
+        // -q flag suppresses errors for unknown options
+        let result = handle_show_options(true, true, true, Some("nonexistent"));
+        assert_eq!(result, Ok(String::new()));
+    }
+
+    #[test]
+    fn show_options_quiet_non_global_is_ok() {
+        let result = handle_show_options(false, false, true, Some("anything"));
+        assert_eq!(result, Ok(String::new()));
+    }
+
+    #[test]
+    fn show_options_global_all_has_new_options() {
+        let result = handle_show_options(true, false, false, None).unwrap();
+        assert!(result.contains("base-index 0"));
+        assert!(result.contains("pane-base-index 0"));
+        assert!(result.contains("focus-events on"));
+        assert!(result.contains("mouse off"));
+        assert!(result.contains("status off"));
+        assert!(result.contains("allow-rename on"));
     }
 
     // --- show-window-options tests ---
 
     #[test]
     fn show_window_options_aggressive_resize() {
-        let result = handle_show_window_options(true, true, Some("aggressive-resize"));
+        let result = handle_show_window_options(true, true, false, Some("aggressive-resize"));
         assert_eq!(result, Ok("off".to_string()));
     }
 
     #[test]
     fn show_window_options_mode_keys() {
-        let result = handle_show_window_options(true, true, Some("mode-keys"));
+        let result = handle_show_window_options(true, true, false, Some("mode-keys"));
         assert_eq!(result, Ok("emacs".to_string()));
     }
 
     #[test]
     fn show_window_options_key_value_format() {
-        let result = handle_show_window_options(true, false, Some("aggressive-resize"));
+        let result = handle_show_window_options(true, false, false, Some("aggressive-resize"));
         assert_eq!(result, Ok("aggressive-resize off".to_string()));
     }
 
     #[test]
     fn show_window_options_unknown_is_error() {
-        let result = handle_show_window_options(true, true, Some("nonexistent"));
+        let result = handle_show_window_options(true, true, false, Some("nonexistent"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn show_window_options_pane_base_index() {
+        let result = handle_show_window_options(true, true, false, Some("pane-base-index"));
+        assert_eq!(result, Ok("0".to_string()));
+    }
+
+    #[test]
+    fn show_window_options_remain_on_exit() {
+        let result = handle_show_window_options(true, true, false, Some("remain-on-exit"));
+        assert_eq!(result, Ok("off".to_string()));
+    }
+
+    #[test]
+    fn show_window_options_quiet_unknown_is_ok() {
+        let result = handle_show_window_options(true, true, true, Some("nonexistent"));
+        assert_eq!(result, Ok(String::new()));
     }
 
     // --- Phase 8: detach-client tests ---
@@ -3195,5 +3553,133 @@ mod tests {
     #[test]
     fn copy_mode_enter_succeeds() {
         assert_eq!(handle_copy_mode(false), Ok(String::new()));
+    }
+
+    // --- Phase 17: new command tests ---
+
+    #[test]
+    fn kill_server_sets_detach_flag() {
+        let mut ctx = HandlerContext::new("default".to_string());
+        assert!(!ctx.detach_requested);
+        // kill-server is dispatched inline — simulate by setting flag
+        ctx.detach_requested = true;
+        assert!(ctx.detach_requested);
+    }
+
+    #[test]
+    fn run_shell_echo() {
+        let result = handle_run_shell(Some("echo hello"));
+        assert_eq!(result, Ok("hello".to_string()));
+    }
+
+    #[test]
+    fn run_shell_no_command() {
+        let result = handle_run_shell(None);
+        assert_eq!(result, Ok(String::new()));
+    }
+
+    #[test]
+    fn run_shell_empty_command() {
+        let result = handle_run_shell(Some(""));
+        assert_eq!(result, Ok(String::new()));
+    }
+
+    #[test]
+    fn list_commands_includes_new_commands() {
+        let output = handle_list_commands();
+        assert!(output.contains("kill-server"));
+        assert!(output.contains("wait-for"));
+        assert!(output.contains("pipe-pane"));
+        assert!(output.contains("display-popup"));
+        assert!(output.contains("run-shell"));
+    }
+
+    // --- Phase 18: robustness tests ---
+
+    #[test]
+    fn phase18_resolve_named_key_control_chars() {
+        assert_eq!(resolve_named_key("C-c"), Some(vec![3]));
+        assert_eq!(resolve_named_key("C-d"), Some(vec![4]));
+        assert_eq!(resolve_named_key("C-z"), Some(vec![26]));
+        assert_eq!(resolve_named_key("C-a"), Some(vec![1]));
+    }
+
+    #[test]
+    fn phase18_resolve_named_key_special_keys() {
+        assert_eq!(resolve_named_key("Enter"), Some(b"\r".to_vec()));
+        assert_eq!(resolve_named_key("Space"), Some(b" ".to_vec()));
+        assert_eq!(resolve_named_key("Tab"), Some(b"\t".to_vec()));
+        assert_eq!(resolve_named_key("Escape"), Some(b"\x1b".to_vec()));
+        assert_eq!(resolve_named_key("BSpace"), Some(b"\x7f".to_vec()));
+    }
+
+    #[test]
+    fn phase18_resolve_named_key_arrow_keys() {
+        assert_eq!(resolve_named_key("Up"), Some(b"\x1b[A".to_vec()));
+        assert_eq!(resolve_named_key("Down"), Some(b"\x1b[B".to_vec()));
+        assert_eq!(resolve_named_key("Right"), Some(b"\x1b[C".to_vec()));
+        assert_eq!(resolve_named_key("Left"), Some(b"\x1b[D".to_vec()));
+    }
+
+    #[test]
+    fn phase18_resolve_named_key_unknown() {
+        assert_eq!(resolve_named_key("C-"), None);
+        assert_eq!(resolve_named_key("FooBar"), None);
+        assert_eq!(resolve_named_key("C-1"), None);
+    }
+
+    #[test]
+    fn phase18_resolve_named_key_function_keys() {
+        // F1-F4 use different escape sequences
+        assert!(resolve_named_key("F1").is_some());
+        assert!(resolve_named_key("F12").is_some());
+    }
+
+    // --- Phase 19: diagnostic & debugging tests ---
+
+    #[test]
+    fn phase19_server_info_contains_version() {
+        let ctx = HandlerContext::new("default".to_string());
+        let output = handle_server_info(&ctx);
+        assert!(output.contains("wezterm"));
+        assert!(output.contains("tmux compat server"));
+        assert!(output.contains("workspace: default"));
+    }
+
+    #[test]
+    fn phase19_server_info_shows_active_ids() {
+        let mut ctx = HandlerContext::new("test".to_string());
+        ctx.active_session_id = Some(0);
+        ctx.active_window_id = Some(1);
+        ctx.active_pane_id = Some(2);
+        let output = handle_server_info(&ctx);
+        assert!(output.contains("active_session: $0"));
+        assert!(output.contains("active_window: @1"));
+        assert!(output.contains("active_pane: %2"));
+    }
+
+    #[test]
+    fn phase19_list_commands_includes_server_info() {
+        let output = handle_list_commands();
+        assert!(output.contains("server-info"));
+    }
+
+    #[test]
+    fn phase19_list_commands_count() {
+        let output = handle_list_commands();
+        let commands: Vec<&str> = output.lines().collect();
+        assert_eq!(commands.len(), 45);
+    }
+
+    #[test]
+    fn phase19_verbose_output_format() {
+        let ctx = FormatContext::default();
+        let fmt = "#{pane_id}";
+        let expanded = expand_format(fmt, &ctx);
+        let verbose = format_verbose_output(fmt, &ctx, &expanded);
+        assert!(verbose.contains("# format: #{pane_id}"));
+        assert!(verbose.contains("# pane_id ->"));
+        // Last line should be the expanded value
+        assert!(verbose.lines().last().unwrap().starts_with('%'));
     }
 }

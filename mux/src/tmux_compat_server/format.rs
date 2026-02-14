@@ -57,9 +57,35 @@ impl FormatContext {
     }
 }
 
-/// Expand a tmux format string, substituting `#{variable}` placeholders
-/// and evaluating `#{?condition,true_value,false_value}` conditionals
-/// using the provided context.
+/// Map a single-character tmux short-form alias to the equivalent long-form
+/// variable name. Returns `None` if the character is not a recognized alias.
+///
+/// These match tmux's `format_table[]` in `format.c`.
+fn short_alias_to_variable(ch: u8) -> Option<&'static str> {
+    match ch {
+        b'D' => Some("pane_id"),
+        b'F' => Some("window_flags"),
+        b'I' => Some("window_index"),
+        b'P' => Some("pane_index"),
+        b'S' => Some("session_name"),
+        b'T' => Some("pane_title"),
+        b'W' => Some("window_name"),
+        _ => None,
+    }
+}
+
+/// Expand a tmux format string, substituting `#{variable}` placeholders,
+/// single-character `#X` short-form aliases, and evaluating
+/// `#{?condition,true_value,false_value}` conditionals using the provided
+/// context.
+///
+/// Short-form aliases (from tmux `format_table[]`):
+///   `#D` → `#{pane_id}`, `#F` → `#{window_flags}`,
+///   `#I` → `#{window_index}`, `#P` → `#{pane_index}`,
+///   `#S` → `#{session_name}`, `#T` → `#{pane_title}`,
+///   `#W` → `#{window_name}`
+///
+/// `##` expands to a literal `#`.
 ///
 /// Unknown variables expand to the empty string.
 pub fn expand_format(fmt: &str, ctx: &FormatContext) -> String {
@@ -69,19 +95,32 @@ pub fn expand_format(fmt: &str, ctx: &FormatContext) -> String {
     let mut i = 0;
 
     while i < len {
-        if i + 1 < len && bytes[i] == b'#' && bytes[i + 1] == b'{' {
-            // Start of a format expression. Find the matching closing brace,
-            // accounting for nested braces (tmux doesn't nest `#{}` but we
-            // handle brace depth for robustness).
-            let start = i + 2;
-            if let Some(end) = find_matching_brace(bytes, start) {
-                let expr = &fmt[start..end];
-                expand_expr(expr, ctx, &mut output);
-                i = end + 1;
-            } else {
-                // No matching `}` found — emit the `#{` literally and move on.
-                output.push_str("#{");
+        if i + 1 < len && bytes[i] == b'#' {
+            let next = bytes[i + 1];
+            if next == b'{' {
+                // Long-form expression: #{variable} or #{?cond,t,f}
+                let start = i + 2;
+                if let Some(end) = find_matching_brace(bytes, start) {
+                    let expr = &fmt[start..end];
+                    expand_expr(expr, ctx, &mut output);
+                    i = end + 1;
+                } else {
+                    // No matching `}` found — emit the `#{` literally and move on.
+                    output.push_str("#{");
+                    i += 2;
+                }
+            } else if next == b'#' {
+                // `##` → literal `#`
+                output.push('#');
                 i += 2;
+            } else if let Some(var_name) = short_alias_to_variable(next) {
+                // Short-form alias: #D, #F, #I, #P, #S, #T, #W
+                resolve_variable(var_name, ctx, &mut output);
+                i += 2;
+            } else {
+                // Unrecognized `#X` — emit literally.
+                output.push('#');
+                i += 1;
             }
         } else {
             output.push(fmt[i..].chars().next().unwrap());
@@ -709,5 +748,140 @@ mod tests {
         };
         let fmt = "#{window_id} #{window_name}#{window_flags} (#{window_panes} panes)";
         assert_eq!(expand_format(fmt, &ctx), "@2 editor*Z (3 panes)");
+    }
+
+    // --- Phase 14: short-form format alias tests ---
+
+    #[test]
+    fn phase14_short_alias_d_pane_id() {
+        let ctx = test_ctx();
+        assert_eq!(expand_format("#D", &ctx), "%5");
+    }
+
+    #[test]
+    fn phase14_short_alias_f_window_flags() {
+        let ctx = test_ctx();
+        assert_eq!(expand_format("#F", &ctx), "*");
+    }
+
+    #[test]
+    fn phase14_short_alias_i_window_index() {
+        let ctx = test_ctx();
+        assert_eq!(expand_format("#I", &ctx), "0");
+    }
+
+    #[test]
+    fn phase14_short_alias_p_pane_index() {
+        let ctx = test_ctx();
+        assert_eq!(expand_format("#P", &ctx), "0");
+    }
+
+    #[test]
+    fn phase14_short_alias_s_session_name() {
+        let ctx = test_ctx();
+        assert_eq!(expand_format("#S", &ctx), "main");
+    }
+
+    #[test]
+    fn phase14_short_alias_t_pane_title() {
+        let ctx = test_ctx();
+        assert_eq!(expand_format("#T", &ctx), "~/project");
+    }
+
+    #[test]
+    fn phase14_short_alias_w_window_name() {
+        let ctx = test_ctx();
+        assert_eq!(expand_format("#W", &ctx), "bash");
+    }
+
+    #[test]
+    fn phase14_double_hash_literal() {
+        let ctx = test_ctx();
+        assert_eq!(expand_format("##", &ctx), "#");
+    }
+
+    #[test]
+    fn phase14_double_hash_in_text() {
+        let ctx = test_ctx();
+        assert_eq!(expand_format("foo ## bar", &ctx), "foo # bar");
+    }
+
+    #[test]
+    fn phase14_mixed_short_and_long_form() {
+        let ctx = FormatContext {
+            session_name: "dev".to_string(),
+            window_index: 2,
+            pane_index: 1,
+            ..Default::default()
+        };
+        // Mix of #S (short) and #{window_index} (long) and #P (short)
+        assert_eq!(expand_format("#S:#{window_index}.#P", &ctx), "dev:2.1");
+    }
+
+    #[test]
+    fn phase14_short_form_display_message_pattern() {
+        // Claude Code uses: display-message -p '#S:#I.#P'
+        let ctx = FormatContext {
+            session_name: "main".to_string(),
+            window_index: 0,
+            pane_index: 3,
+            ..Default::default()
+        };
+        assert_eq!(expand_format("#S:#I.#P", &ctx), "main:0.3");
+    }
+
+    #[test]
+    fn phase14_short_form_list_panes_pattern() {
+        // Claude Code uses: list-panes -F '#D #P'
+        let ctx = FormatContext {
+            pane_id: 7,
+            pane_index: 2,
+            ..Default::default()
+        };
+        assert_eq!(expand_format("#D #P", &ctx), "%7 2");
+    }
+
+    #[test]
+    fn phase14_unrecognized_short_form_literal() {
+        let ctx = test_ctx();
+        // #X where X is not a known alias — emit '#' literally, then 'X'
+        assert_eq!(expand_format("#Z", &ctx), "#Z");
+    }
+
+    #[test]
+    fn phase14_hash_at_end_of_string() {
+        let ctx = test_ctx();
+        // Lone '#' at end — emit literally
+        assert_eq!(expand_format("test#", &ctx), "test#");
+    }
+
+    #[test]
+    fn phase14_all_short_aliases_match_long_form() {
+        let ctx = test_ctx();
+        assert_eq!(expand_format("#D", &ctx), expand_format("#{pane_id}", &ctx));
+        assert_eq!(
+            expand_format("#F", &ctx),
+            expand_format("#{window_flags}", &ctx)
+        );
+        assert_eq!(
+            expand_format("#I", &ctx),
+            expand_format("#{window_index}", &ctx)
+        );
+        assert_eq!(
+            expand_format("#P", &ctx),
+            expand_format("#{pane_index}", &ctx)
+        );
+        assert_eq!(
+            expand_format("#S", &ctx),
+            expand_format("#{session_name}", &ctx)
+        );
+        assert_eq!(
+            expand_format("#T", &ctx),
+            expand_format("#{pane_title}", &ctx)
+        );
+        assert_eq!(
+            expand_format("#W", &ctx),
+            expand_format("#{window_name}", &ctx)
+        );
     }
 }
