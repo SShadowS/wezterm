@@ -17,6 +17,7 @@ members = [
   "wezterm-surface",
   "wezterm-uds",
   "tmux-compat-shim",
+  "env-shim",
 ]
 resolver = "2"
 exclude = [

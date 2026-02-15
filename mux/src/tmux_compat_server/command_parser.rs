@@ -205,6 +205,8 @@ pub enum TmuxCliCommand {
         background: bool,
         target: Option<String>,
         command: Option<String>,
+        /// Delay in seconds (stored as string to keep Eq derivation).
+        delay: Option<String>,
     },
     // Phase 19: diagnostic & debugging
     ServerInfo,
@@ -894,8 +896,7 @@ fn parse_show_window_options(args: &[String]) -> Result<TmuxCliCommand> {
     let mut iter = strs.iter().copied();
     while let Some(arg) = iter.next() {
         // Parse combined flags like -gvq, -qgv, etc.
-        if arg.starts_with('-') && arg.len() > 1 && arg.chars().skip(1).all(|c| "gvq".contains(c))
-        {
+        if arg.starts_with('-') && arg.len() > 1 && arg.chars().skip(1).all(|c| "gvq".contains(c)) {
             for ch in arg.chars().skip(1) {
                 match ch {
                     'g' => global = true,
@@ -1322,8 +1323,7 @@ fn parse_display_popup(args: &[String]) -> Result<TmuxCliCommand> {
         match arg {
             "-t" => target = Some(take_flag_value("-t", &mut iter)?),
             // Accept and ignore all other flags with values
-            "-d" | "-e" | "-h" | "-w" | "-x" | "-y" | "-s" | "-S" | "-T" | "-B" | "-b"
-            | "-C" => {
+            "-d" | "-e" | "-h" | "-w" | "-x" | "-y" | "-s" | "-S" | "-T" | "-B" | "-b" | "-C" => {
                 let _ = take_flag_value(arg, &mut iter)?;
             }
             // Flags without values
@@ -1341,6 +1341,7 @@ fn parse_run_shell(args: &[String]) -> Result<TmuxCliCommand> {
     let mut background = false;
     let mut target = None;
     let mut command = None;
+    let mut delay = None;
 
     let strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     let mut iter = strs.iter().copied();
@@ -1350,7 +1351,7 @@ fn parse_run_shell(args: &[String]) -> Result<TmuxCliCommand> {
             "-C" => {} // tmux command mode — ignore
             "-t" => target = Some(take_flag_value("-t", &mut iter)?),
             "-d" => {
-                let _ = take_flag_value("-d", &mut iter)?; // delay — ignore
+                delay = Some(take_flag_value("-d", &mut iter)?);
             }
             _ => {
                 command = Some(arg.to_string());
@@ -1362,6 +1363,7 @@ fn parse_run_shell(args: &[String]) -> Result<TmuxCliCommand> {
         background,
         target,
         command,
+        delay,
     })
 }
 
@@ -1388,8 +1390,8 @@ mod tests {
                 target: None,
                 size: None,
                 print_and_format: None,
-            cwd: None,
-            env: vec![],
+                cwd: None,
+                env: vec![],
             }
         );
     }
@@ -1404,8 +1406,8 @@ mod tests {
                 target: Some("%3".into()),
                 size: None,
                 print_and_format: None,
-            cwd: None,
-            env: vec![],
+                cwd: None,
+                env: vec![],
             }
         );
     }
@@ -1420,8 +1422,8 @@ mod tests {
                 target: None,
                 size: None,
                 print_and_format: None,
-            cwd: None,
-            env: vec![],
+                cwd: None,
+                env: vec![],
             }
         );
     }
@@ -1436,8 +1438,8 @@ mod tests {
                 target: None,
                 size: Some("50%".into()),
                 print_and_format: None,
-            cwd: None,
-            env: vec![],
+                cwd: None,
+                env: vec![],
             }
         );
     }
@@ -1652,8 +1654,8 @@ mod tests {
                 target: None,
                 name: None,
                 print_and_format: None,
-            cwd: None,
-            env: vec![],
+                cwd: None,
+                env: vec![],
             }
         );
     }
@@ -1666,8 +1668,8 @@ mod tests {
                 target: None,
                 name: Some("mywin".into()),
                 print_and_format: None,
-            cwd: None,
-            env: vec![],
+                cwd: None,
+                env: vec![],
             }
         );
     }
@@ -1680,8 +1682,8 @@ mod tests {
                 target: Some("$0".into()),
                 name: Some("editor".into()),
                 print_and_format: None,
-            cwd: None,
-            env: vec![],
+                cwd: None,
+                env: vec![],
             }
         );
     }
@@ -2221,8 +2223,8 @@ mod tests {
                 window_name: None,
                 detached: false,
                 print_and_format: None,
-            cwd: None,
-            env: vec![],
+                cwd: None,
+                env: vec![],
             }
         );
     }
@@ -2236,8 +2238,8 @@ mod tests {
                 window_name: None,
                 detached: false,
                 print_and_format: None,
-            cwd: None,
-            env: vec![],
+                cwd: None,
+                env: vec![],
             }
         );
     }
@@ -2251,8 +2253,8 @@ mod tests {
                 window_name: None,
                 detached: false,
                 print_and_format: None,
-            cwd: None,
-            env: vec![],
+                cwd: None,
+                env: vec![],
             }
         );
     }
@@ -2694,8 +2696,8 @@ mod tests {
                 target: Some("%5".into()),
                 size: Some("70%".into()),
                 print_and_format: Some("#{pane_id}".into()),
-            cwd: None,
-            env: vec![],
+                cwd: None,
+                env: vec![],
             }
         );
     }
@@ -2710,8 +2712,8 @@ mod tests {
                 target: None,
                 size: None,
                 print_and_format: Some("#{session_name}:#{window_index}.#{pane_index}".into()),
-            cwd: None,
-            env: vec![],
+                cwd: None,
+                env: vec![],
             }
         );
     }
@@ -2741,8 +2743,8 @@ mod tests {
                 target: Some("main".into()),
                 name: Some("editor".into()),
                 print_and_format: Some("#{pane_id}".into()),
-            cwd: None,
-            env: vec![],
+                cwd: None,
+                env: vec![],
             }
         );
     }
@@ -2756,8 +2758,8 @@ mod tests {
                 window_name: Some("main".into()),
                 detached: true,
                 print_and_format: Some("#{pane_id}".into()),
-            cwd: None,
-            env: vec![],
+                cwd: None,
+                env: vec![],
             }
         );
     }
@@ -2926,10 +2928,7 @@ mod tests {
 
     #[test]
     fn alias_ls_for_list_sessions() {
-        assert_eq!(
-            parse("ls"),
-            TmuxCliCommand::ListSessions { format: None }
-        );
+        assert_eq!(parse("ls"), TmuxCliCommand::ListSessions { format: None });
     }
 
     #[test]
@@ -2977,8 +2976,8 @@ mod tests {
                 target: None,
                 size: None,
                 print_and_format: None,
-            cwd: None,
-            env: vec![],
+                cwd: None,
+                env: vec![],
             }
         );
     }
@@ -2991,8 +2990,8 @@ mod tests {
                 target: None,
                 name: Some("test".into()),
                 print_and_format: None,
-            cwd: None,
-            env: vec![],
+                cwd: None,
+                env: vec![],
             }
         );
     }
@@ -3227,6 +3226,7 @@ mod tests {
                 background: false,
                 target: None,
                 command: Some("echo hello".into()),
+                delay: None,
             }
         );
     }
@@ -3239,6 +3239,7 @@ mod tests {
                 background: true,
                 target: None,
                 command: Some("sleep 1".into()),
+                delay: None,
             }
         );
     }
@@ -3251,6 +3252,7 @@ mod tests {
                 background: false,
                 target: Some("%5".into()),
                 command: Some("echo hi".into()),
+                delay: None,
             }
         );
     }
@@ -3263,6 +3265,7 @@ mod tests {
                 background: false,
                 target: None,
                 command: Some("date".into()),
+                delay: None,
             }
         );
     }
@@ -3275,6 +3278,20 @@ mod tests {
                 background: false,
                 target: None,
                 command: None,
+                delay: None,
+            }
+        );
+    }
+
+    #[test]
+    fn phase17_run_shell_with_delay() {
+        assert_eq!(
+            parse("run-shell -d 2.5 \"echo delayed\""),
+            TmuxCliCommand::RunShell {
+                background: false,
+                target: None,
+                command: Some("echo delayed".into()),
+                delay: Some("2.5".into()),
             }
         );
     }

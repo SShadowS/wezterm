@@ -1493,6 +1493,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "env-shim"
+version = "0.1.0"
+
+[[package]]
 name = "env_filter"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3455,6 +3459,7 @@ name = "mux"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-channel",
  "async-io",
  "async-trait",
  "base64 0.22.1",

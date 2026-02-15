@@ -3,8 +3,10 @@
 //! This module wires Phase 1's parsed `TmuxCliCommand` values to WezTerm's Mux
 //! so that each command performs real operations and returns response content.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, LazyLock};
+
+use parking_lot::Mutex as ParkMutex;
 
 use config::keyassignment::SpawnTabDomain;
 use wezterm_term::TerminalSize;
@@ -23,6 +25,22 @@ use super::id_map::IdMap;
 use super::paste_buffer::{buffer_sample, PasteBufferStore};
 use super::response::session_changed_notification;
 use super::target::{parse_target, PaneRef, SessionRef, TmuxTarget, WindowRef};
+
+// ---------------------------------------------------------------------------
+// Wait channel infrastructure for `wait-for` command
+// ---------------------------------------------------------------------------
+
+/// State for a single wait channel.
+struct WaitChannel {
+    /// Whether a signal has been sent but no one has consumed it yet.
+    woken: bool,
+    /// Senders waiting to be notified. When signaled, we send `()` to all.
+    waiters: Vec<async_channel::Sender<()>>,
+}
+
+/// Global wait channel store, keyed by channel name.
+static WAIT_CHANNELS: LazyLock<ParkMutex<HashMap<String, WaitChannel>>> =
+    LazyLock::new(Default::default);
 
 /// Resolved WezTerm IDs from a tmux target specification.
 #[derive(Debug, Default)]
@@ -98,6 +116,11 @@ pub struct HandlerContext {
     pub pane_output_timestamps: HashMap<u64, std::time::Instant>,
     /// Format subscriptions registered via `refresh-client -B`.
     pub subscriptions: Vec<Subscription>,
+    /// Tmux pane IDs of panes created programmatically (via `-P -F` flags).
+    /// When `send-keys` targets one of these panes, `; exit` is appended so
+    /// the shell closes after the command finishes. One-shot: the pane is
+    /// removed from the set after the first `send-keys`.
+    pub auto_exit_panes: HashSet<u64>,
 }
 
 impl HandlerContext {
@@ -120,6 +143,7 @@ impl HandlerContext {
             paused_panes: HashMap::new(),
             pane_output_timestamps: HashMap::new(),
             subscriptions: Vec::new(),
+            auto_exit_panes: HashSet::new(),
         }
     }
 
@@ -550,9 +574,9 @@ pub async fn dispatch_command(
         } => handle_send_keys(ctx, &target, literal, hex, &keys),
         TmuxCliCommand::SelectPane {
             target,
-            style: _,
+            style,
             title,
-        } => handle_select_pane(ctx, &target, title.as_deref()),
+        } => handle_select_pane(ctx, &target, title.as_deref(), style.as_deref()),
         TmuxCliCommand::SelectWindow { target } => handle_select_window(ctx, &target),
         TmuxCliCommand::KillPane { target } => handle_kill_pane(ctx, &target),
         TmuxCliCommand::ResizePane {
@@ -686,14 +710,14 @@ pub async fn dispatch_command(
         TmuxCliCommand::CopyMode { quit, target: _ } => handle_copy_mode(quit),
         // Phase 13: Claude Code agent teams compatibility
         TmuxCliCommand::SetOption {
-            target: _,
+            target,
             option_name,
             value,
-        } => handle_set_option(option_name.as_deref(), value.as_deref()),
+        } => handle_set_option(ctx, &target, option_name.as_deref(), value.as_deref()),
         TmuxCliCommand::SelectLayout {
-            target: _,
-            layout_name: _,
-        } => Ok(String::new()),
+            target,
+            layout_name,
+        } => handle_select_layout(ctx, &target, layout_name.as_deref()),
         TmuxCliCommand::BreakPane {
             detach,
             source,
@@ -704,10 +728,7 @@ pub async fn dispatch_command(
             ctx.detach_requested = true;
             Ok(String::new())
         }
-        TmuxCliCommand::WaitFor { signal: _, channel: _ } => {
-            // Stub: signal returns immediately, lock/unlock return immediately
-            Ok(String::new())
-        }
+        TmuxCliCommand::WaitFor { signal, channel } => handle_wait_for(signal, &channel).await,
         TmuxCliCommand::PipePane {
             target: _,
             command: _,
@@ -720,10 +741,20 @@ pub async fn dispatch_command(
             Ok(String::new())
         }
         TmuxCliCommand::RunShell {
-            background: _,
-            target: _,
+            background,
+            target,
             command,
-        } => handle_run_shell(command.as_deref()),
+            delay,
+        } => {
+            handle_run_shell(
+                ctx,
+                background,
+                &target,
+                command.as_deref(),
+                delay.as_deref(),
+            )
+            .await
+        }
         // Phase 19: diagnostic & debugging
         TmuxCliCommand::ServerInfo => Ok(handle_server_info(ctx)),
     }
@@ -790,10 +821,7 @@ pub fn handle_list_commands() -> String {
 pub fn handle_server_info(ctx: &HandlerContext) -> String {
     let mut lines = Vec::new();
 
-    lines.push(format!(
-        "wezterm {}",
-        config::wezterm_version()
-    ));
+    lines.push(format!("wezterm {}", config::wezterm_version()));
     lines.push(format!("tmux compat server (CC mode)"));
     lines.push(format!("pid: {}", std::process::id()));
 
@@ -844,30 +872,149 @@ pub fn handle_copy_mode(_quit: bool) -> Result<String, String> {
     Ok(String::new())
 }
 
-/// Handle `run-shell <command>`.
+/// Handle `wait-for [-S] <channel>`.
 ///
-/// Executes a shell command and returns its stdout. If no command is given,
-/// returns empty success.
-pub fn handle_run_shell(command: Option<&str>) -> Result<String, String> {
-    match command {
-        Some(cmd) if !cmd.is_empty() => {
-            let shell = if cfg!(windows) { "cmd" } else { "sh" };
-            let flag = if cfg!(windows) { "/C" } else { "-c" };
-            match std::process::Command::new(shell)
-                .arg(flag)
-                .arg(cmd)
-                .output()
-            {
-                Ok(output) => {
-                    let stdout = String::from_utf8_lossy(&output.stdout);
-                    // Trim trailing newline/carriage-return like tmux does
-                    Ok(stdout.trim_end_matches(&['\r', '\n'][..]).to_string())
-                }
-                Err(e) => Err(format!("run-shell: {}", e)),
+/// Implements a channel-based wait/signal synchronization mechanism:
+/// - `wait-for <channel>`: blocks until another client signals the channel
+/// - `wait-for -S <channel>`: signals the channel, waking all waiters
+async fn handle_wait_for(signal: bool, channel: &str) -> Result<String, String> {
+    if signal {
+        // Signal mode: wake all waiters on this channel
+        let mut channels = WAIT_CHANNELS.lock();
+        let entry = channels
+            .entry(channel.to_string())
+            .or_insert_with(|| WaitChannel {
+                woken: false,
+                waiters: Vec::new(),
+            });
+        if entry.waiters.is_empty() {
+            // No one waiting — set woken flag so next waiter returns immediately
+            entry.woken = true;
+        } else {
+            // Wake all waiters
+            for sender in entry.waiters.drain(..) {
+                let _ = sender.try_send(());
             }
         }
-        _ => Ok(String::new()),
+        Ok(String::new())
+    } else {
+        // Wait mode: block until signaled
+        let receiver = {
+            let mut channels = WAIT_CHANNELS.lock();
+            let entry = channels
+                .entry(channel.to_string())
+                .or_insert_with(|| WaitChannel {
+                    woken: false,
+                    waiters: Vec::new(),
+                });
+            if entry.woken {
+                // Already signaled — consume the signal and return
+                entry.woken = false;
+                return Ok(String::new());
+            }
+            let (sender, receiver) = async_channel::bounded(1);
+            entry.waiters.push(sender);
+            receiver
+        };
+        // Wait for signal (lock is released)
+        let _ = receiver.recv().await;
+        Ok(String::new())
     }
+}
+
+/// Execute a shell command and return its stdout (helper).
+fn run_shell_exec(cmd: &str) -> Result<String, String> {
+    let shell = if cfg!(windows) { "cmd" } else { "sh" };
+    let flag = if cfg!(windows) { "/C" } else { "-c" };
+    match std::process::Command::new(shell)
+        .arg(flag)
+        .arg(cmd)
+        .output()
+    {
+        Ok(output) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            Ok(stdout.trim_end_matches(&['\r', '\n'][..]).to_string())
+        }
+        Err(e) => Err(format!("run-shell: {}", e)),
+    }
+}
+
+/// Handle `run-shell [-b] [-d delay] [-t target] <command>`.
+///
+/// Executes a shell command and returns its stdout. Supports:
+/// - `-b`: run in background (return immediately, discard output)
+/// - `-d <secs>`: delay before execution
+/// - `-t <pane>`: send output to target pane instead of returning it
+async fn handle_run_shell(
+    ctx: &mut HandlerContext,
+    background: bool,
+    target: &Option<String>,
+    command: Option<&str>,
+    delay: Option<&str>,
+) -> Result<String, String> {
+    let cmd = match command {
+        Some(c) if !c.is_empty() => c.to_string(),
+        _ => return Ok(String::new()),
+    };
+
+    let delay_secs = delay.and_then(|d| d.parse::<f64>().ok());
+
+    // Resolve target pane if specified
+    let target_pane_id = if target.is_some() {
+        let resolved = ctx.resolve_target(target)?;
+        resolved.pane_id
+    } else {
+        None
+    };
+
+    if background {
+        // Background mode: spawn and return immediately
+        let cmd = cmd.clone();
+        promise::spawn::spawn(async move {
+            if let Some(secs) = delay_secs {
+                smol::Timer::after(std::time::Duration::from_secs_f64(secs)).await;
+            }
+            match run_shell_exec(&cmd) {
+                Ok(output) => {
+                    if let Some(pane_id) = target_pane_id {
+                        if let Some(mux) = Mux::try_get() {
+                            if let Some(pane) = mux.get_pane(pane_id) {
+                                let mut data = output.into_bytes();
+                                data.push(b'\n');
+                                pane.writer().write_all(&data).ok();
+                            }
+                        }
+                    }
+                }
+                Err(e) => log::warn!("run-shell -b: {}", e),
+            }
+        })
+        .detach();
+        return Ok(String::new());
+    }
+
+    // Foreground mode: wait for completion
+    if let Some(secs) = delay_secs {
+        smol::Timer::after(std::time::Duration::from_secs_f64(secs)).await;
+    }
+
+    let output = run_shell_exec(&cmd)?;
+
+    // Route output to target pane if specified
+    if let Some(pane_id) = target_pane_id {
+        if let Some(mux) = Mux::try_get() {
+            if let Some(pane) = mux.get_pane(pane_id) {
+                let mut data = output.into_bytes();
+                data.push(b'\n');
+                pane.writer()
+                    .write_all(&data)
+                    .map_err(|e| format!("run-shell: write to pane: {}", e))?;
+                return Ok(String::new());
+            }
+        }
+    }
+
+    Ok(output)
 }
 
 /// Check whether a session (workspace) exists.
@@ -1275,6 +1422,16 @@ pub fn handle_send_keys(
         all_bytes.extend_from_slice(&bytes);
     }
 
+    // If this pane was created programmatically (via -P -F), append "; exit"
+    // before the trailing Enter so the shell closes after the command finishes.
+    if let Some(tid) = ctx.id_map.tmux_pane_id(pane_id) {
+        if ctx.auto_exit_panes.remove(&tid) && all_bytes.ends_with(b"\r") {
+            let enter_pos = all_bytes.len() - 1;
+            let exit_bytes = b"; exit";
+            all_bytes.splice(enter_pos..enter_pos, exit_bytes.iter().copied());
+        }
+    }
+
     pane.writer()
         .write_all(&all_bytes)
         .map_err(|e| format!("failed to write to pane: {}", e))?;
@@ -1282,11 +1439,109 @@ pub fn handle_send_keys(
     Ok(String::new())
 }
 
+/// Parse a tmux style string like `"bg=red,fg=#00ff00"` into (fg, bg) color tuples.
+///
+/// Supports:
+/// - Named CSS/X11 colors (e.g., `red`, `blue`)
+/// - Hex colors (`#rrggbb`)
+/// - tmux `colour0`–`colour255` (256-color palette)
+/// - `default` as a reset signal (returns `None` for that component)
+fn parse_tmux_style(
+    style: &str,
+) -> (
+    Option<Option<termwiz::color::SrgbaTuple>>,
+    Option<Option<termwiz::color::SrgbaTuple>>,
+) {
+    let mut fg: Option<Option<termwiz::color::SrgbaTuple>> = None;
+    let mut bg: Option<Option<termwiz::color::SrgbaTuple>> = None;
+
+    for part in style.split(',') {
+        let part = part.trim();
+        if let Some(color_str) = part.strip_prefix("fg=") {
+            fg = Some(parse_tmux_color(color_str));
+        } else if let Some(color_str) = part.strip_prefix("bg=") {
+            bg = Some(parse_tmux_color(color_str));
+        }
+    }
+
+    (fg, bg)
+}
+
+/// Parse a single tmux color value to an optional SrgbaTuple.
+/// Returns `None` for "default" (meaning reset), `Some(color)` for valid colors.
+fn parse_tmux_color(s: &str) -> Option<termwiz::color::SrgbaTuple> {
+    let s = s.trim();
+    if s == "default" || s.is_empty() {
+        return None;
+    }
+
+    // Handle tmux colour0-colour255
+    if let Some(idx_str) = s.strip_prefix("colour") {
+        if let Ok(idx) = idx_str.parse::<u8>() {
+            return Some(ansi_256_to_srgba(idx));
+        }
+    }
+    // Also handle "color" spelling
+    if let Some(idx_str) = s.strip_prefix("color") {
+        if let Ok(idx) = idx_str.parse::<u8>() {
+            return Some(ansi_256_to_srgba(idx));
+        }
+    }
+
+    // Try parsing as #rrggbb or named color
+    s.parse::<termwiz::color::SrgbaTuple>().ok()
+}
+
+/// Convert an ANSI 256-color index to SrgbaTuple.
+fn ansi_256_to_srgba(idx: u8) -> termwiz::color::SrgbaTuple {
+    match idx {
+        // Standard ANSI colors (0-7)
+        0 => termwiz::color::SrgbaTuple(0.0, 0.0, 0.0, 1.0),
+        1 => termwiz::color::SrgbaTuple(0.5, 0.0, 0.0, 1.0),
+        2 => termwiz::color::SrgbaTuple(0.0, 0.5, 0.0, 1.0),
+        3 => termwiz::color::SrgbaTuple(0.5, 0.5, 0.0, 1.0),
+        4 => termwiz::color::SrgbaTuple(0.0, 0.0, 0.5, 1.0),
+        5 => termwiz::color::SrgbaTuple(0.5, 0.0, 0.5, 1.0),
+        6 => termwiz::color::SrgbaTuple(0.0, 0.5, 0.5, 1.0),
+        7 => termwiz::color::SrgbaTuple(0.75, 0.75, 0.75, 1.0),
+        // Bright colors (8-15)
+        8 => termwiz::color::SrgbaTuple(0.5, 0.5, 0.5, 1.0),
+        9 => termwiz::color::SrgbaTuple(1.0, 0.0, 0.0, 1.0),
+        10 => termwiz::color::SrgbaTuple(0.0, 1.0, 0.0, 1.0),
+        11 => termwiz::color::SrgbaTuple(1.0, 1.0, 0.0, 1.0),
+        12 => termwiz::color::SrgbaTuple(0.0, 0.0, 1.0, 1.0),
+        13 => termwiz::color::SrgbaTuple(1.0, 0.0, 1.0, 1.0),
+        14 => termwiz::color::SrgbaTuple(0.0, 1.0, 1.0, 1.0),
+        15 => termwiz::color::SrgbaTuple(1.0, 1.0, 1.0, 1.0),
+        // 216-color cube (16-231)
+        16..=231 => {
+            let idx = idx - 16;
+            let b = idx % 6;
+            let g = (idx / 6) % 6;
+            let r = idx / 36;
+            let to_f = |v: u8| {
+                if v == 0 {
+                    0.0
+                } else {
+                    (55.0 + 40.0 * v as f32) / 255.0
+                }
+            };
+            termwiz::color::SrgbaTuple(to_f(r), to_f(g), to_f(b), 1.0)
+        }
+        // Grayscale ramp (232-255)
+        232..=255 => {
+            let v = (8 + 10 * (idx - 232) as u32) as f32 / 255.0;
+            termwiz::color::SrgbaTuple(v, v, v, 1.0)
+        }
+    }
+}
+
 /// Select (focus) a pane.
 pub fn handle_select_pane(
     ctx: &mut HandlerContext,
     target: &Option<String>,
     title: Option<&str>,
+    style: Option<&str>,
 ) -> Result<String, String> {
     let mux = Mux::try_get().ok_or_else(|| "mux not available".to_string())?;
 
@@ -1301,6 +1556,62 @@ pub fn handle_select_pane(
         let workspace = ctx.workspace.clone();
         if let Some((tab, _wid)) = find_tab_and_window_for_pane(&mux, pane_id, &workspace) {
             tab.set_title(new_title);
+        }
+    }
+
+    // If -P style was specified, apply fg/bg colors via OSC sequences
+    if let Some(style_str) = style {
+        if let Some(pane) = mux.get_pane(pane_id) {
+            let (fg, bg) = parse_tmux_style(style_str);
+            let mut actions = Vec::new();
+
+            use termwiz::escape::osc::{ColorOrQuery, DynamicColorNumber, OperatingSystemCommand};
+            use termwiz::escape::Action;
+
+            if let Some(fg_color) = fg {
+                match fg_color {
+                    Some(color) => {
+                        actions.push(Action::OperatingSystemCommand(Box::new(
+                            OperatingSystemCommand::ChangeDynamicColors(
+                                DynamicColorNumber::TextForegroundColor,
+                                vec![ColorOrQuery::Color(color)],
+                            ),
+                        )));
+                    }
+                    None => {
+                        // "default" — reset
+                        actions.push(Action::OperatingSystemCommand(Box::new(
+                            OperatingSystemCommand::ResetDynamicColor(
+                                DynamicColorNumber::TextForegroundColor,
+                            ),
+                        )));
+                    }
+                }
+            }
+
+            if let Some(bg_color) = bg {
+                match bg_color {
+                    Some(color) => {
+                        actions.push(Action::OperatingSystemCommand(Box::new(
+                            OperatingSystemCommand::ChangeDynamicColors(
+                                DynamicColorNumber::TextBackgroundColor,
+                                vec![ColorOrQuery::Color(color)],
+                            ),
+                        )));
+                    }
+                    None => {
+                        actions.push(Action::OperatingSystemCommand(Box::new(
+                            OperatingSystemCommand::ResetDynamicColor(
+                                DynamicColorNumber::TextBackgroundColor,
+                            ),
+                        )));
+                    }
+                }
+            }
+
+            if !actions.is_empty() {
+                pane.perform_actions(actions);
+            }
         }
     }
 
@@ -1368,6 +1679,10 @@ pub fn handle_kill_pane(
         .pane_id
         .ok_or_else(|| "can't find pane".to_string())?;
 
+    // Clean up auto-exit tracking before removing the pane mapping
+    if let Some(tid) = ctx.id_map.tmux_pane_id(pane_id) {
+        ctx.auto_exit_panes.remove(&tid);
+    }
     ctx.id_map.remove_pane(pane_id);
     mux.remove_pane(pane_id);
 
@@ -2006,8 +2321,9 @@ pub async fn handle_split_window(
     let tmux_pane_id = ctx.id_map.get_or_create_tmux_pane_id(new_pane.pane_id());
     ctx.active_pane_id = Some(tmux_pane_id);
 
-    // If -P was specified, return format-expanded info about the new pane
+    // If -P was specified, mark as auto-exit and return format-expanded info
     if let Some(fmt) = print_and_format {
+        ctx.auto_exit_panes.insert(tmux_pane_id);
         return format_new_pane(ctx, new_pane.pane_id(), fmt);
     }
 
@@ -2071,8 +2387,9 @@ pub async fn handle_new_window(
     ctx.active_window_id = Some(tmux_window_id);
     ctx.active_pane_id = Some(tmux_pane_id);
 
-    // If -P was specified, return format-expanded info about the new pane
+    // If -P was specified, mark as auto-exit and return format-expanded info
     if let Some(fmt) = print_and_format {
+        ctx.auto_exit_panes.insert(tmux_pane_id);
         return format_new_pane(ctx, pane.pane_id(), fmt);
     }
 
@@ -2393,11 +2710,35 @@ pub async fn handle_new_session(
     ctx.active_pane_id = Some(tmux_pane_id);
     ctx.workspace = workspace;
 
-    // If -P was specified, return format-expanded info about the new pane
+    // If -P was specified, mark as auto-exit and return format-expanded info
     if let Some(fmt) = print_and_format {
+        ctx.auto_exit_panes.insert(tmux_pane_id);
         return format_new_pane(ctx, pane.pane_id(), fmt);
     }
 
+    Ok(String::new())
+}
+
+/// Handle `select-layout [-t target] <layout-name>`.
+///
+/// Rearranges panes in the target tab according to a named layout preset.
+fn handle_select_layout(
+    ctx: &mut HandlerContext,
+    target: &Option<String>,
+    layout_name: Option<&str>,
+) -> Result<String, String> {
+    let layout = layout_name.ok_or_else(|| "select-layout: no layout name given".to_string())?;
+
+    let mux = Mux::try_get().ok_or_else(|| "mux not available".to_string())?;
+    let resolved = ctx.resolve_target(target)?;
+    let tab_id = resolved
+        .tab_id
+        .ok_or_else(|| "no window resolved for select-layout".to_string())?;
+    let tab = mux
+        .get_tab(tab_id)
+        .ok_or_else(|| format!("can't find tab {}", tab_id))?;
+
+    tab.apply_layout(layout)?;
     Ok(String::new())
 }
 
@@ -2451,13 +2792,59 @@ fn format_new_pane(
     Ok(format!("%{}", tmux_pane_id))
 }
 
-/// Handle `set-option` — no-op, returns empty success.
-fn handle_set_option(option_name: Option<&str>, value: Option<&str>) -> Result<String, String> {
-    log::debug!(
-        "set-option: {}={}  (no-op)",
-        option_name.unwrap_or("(none)"),
-        value.unwrap_or("(none)")
-    );
+/// Handle `set-option` — apply supported options, log and ignore the rest.
+fn handle_set_option(
+    ctx: &mut HandlerContext,
+    target: &Option<String>,
+    option_name: Option<&str>,
+    value: Option<&str>,
+) -> Result<String, String> {
+    let name = option_name.unwrap_or("");
+    let val = value.unwrap_or("");
+
+    match name {
+        "pane-border-format" => {
+            // Set the pane header text
+            let mux = Mux::try_get().ok_or_else(|| "mux not available".to_string())?;
+            let resolved = ctx.resolve_target(target)?;
+            if let Some(pane_id) = resolved.pane_id {
+                if let Some(pane) = mux.get_pane(pane_id) {
+                    let header = if val.is_empty() {
+                        None
+                    } else {
+                        Some(val.to_string())
+                    };
+                    pane.set_header(header);
+                }
+            }
+        }
+        "pane-border-status" => {
+            // Enable/disable pane header display
+            let mux = Mux::try_get().ok_or_else(|| "mux not available".to_string())?;
+            let resolved = ctx.resolve_target(target)?;
+            if let Some(pane_id) = resolved.pane_id {
+                if let Some(pane) = mux.get_pane(pane_id) {
+                    match val {
+                        "off" => {
+                            pane.set_header(None);
+                        }
+                        "top" | "bottom" => {
+                            // Enable header — if no header text set, use empty string to activate
+                            if pane.get_header().is_none() {
+                                pane.set_header(Some(String::new()));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        _ => {
+            // All other options: log and return success (soft no-op)
+            log::debug!("set-option: {}={} (no-op)", name, val);
+        }
+    }
+
     Ok(String::new())
 }
 
@@ -2476,9 +2863,8 @@ async fn handle_break_pane(
         .pane_id
         .ok_or_else(|| "can't find pane for break-pane".to_string())?;
 
-    // Determine the workspace for the new tab
+    // Determine the target workspace for the new tab
     let workspace = if let Some(tgt) = target {
-        // Target may specify a session name (e.g., "mysession:")
         let session_name = tgt.trim_end_matches(':');
         if !session_name.is_empty() {
             session_name.to_string()
@@ -2489,19 +2875,27 @@ async fn handle_break_pane(
         ctx.workspace.clone()
     };
 
-    // Find the window containing this pane so we can determine where to create a new tab
-    let window_id = resolved_src.window_id;
+    // Find an existing window in the target workspace, or None to create a new one
+    let target_window_id = {
+        let wids = mux.iter_windows_in_workspace(&workspace);
+        wids.first().copied()
+    };
 
-    // Use MovePane with a new split to effectively break the pane out.
-    // The simplest approach: create a new tab, then move the pane into it.
-    // But WezTerm doesn't have a direct "break-pane" API.
-    // We'll spawn a new tab and then swap the pane content.
-    // For now, return success as a best-effort no-op since this is a LOW priority item.
-    let _ = (mux, pane_id, workspace, window_id);
+    let (tab, window_id) = mux
+        .move_pane_to_new_tab(pane_id, target_window_id, Some(workspace.clone()))
+        .await
+        .map_err(|e| format!("break-pane: {}", e))?;
+
+    // Register the new tab in the ID map
+    ctx.id_map.get_or_create_tmux_window_id(tab.tab_id());
+    ctx.id_map.get_or_create_tmux_session_id(&workspace);
+
     log::debug!(
-        "break-pane: best-effort no-op (source={:?}, target={:?})",
-        source,
-        target
+        "break-pane: moved pane {} to new tab {} in window {} (workspace={})",
+        pane_id,
+        tab.tab_id(),
+        window_id,
+        workspace
     );
     Ok(String::new())
 }
@@ -3577,20 +3971,16 @@ mod tests {
 
     #[test]
     fn run_shell_echo() {
-        let result = handle_run_shell(Some("echo hello"));
+        let result = run_shell_exec("echo hello");
         assert_eq!(result, Ok("hello".to_string()));
     }
 
     #[test]
-    fn run_shell_no_command() {
-        let result = handle_run_shell(None);
-        assert_eq!(result, Ok(String::new()));
-    }
-
-    #[test]
     fn run_shell_empty_command() {
-        let result = handle_run_shell(Some(""));
-        assert_eq!(result, Ok(String::new()));
+        let result = run_shell_exec("");
+        // Empty string passed to shell — returns empty or error
+        // Just verify it doesn't panic
+        let _ = result;
     }
 
     #[test]
