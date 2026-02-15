@@ -203,6 +203,10 @@ pub struct PositionedSplit {
     /// For Horizontal splits, how tall the split should be, for Vertical
     /// splits how wide it should be
     pub size: usize,
+    /// Number of cells in the first (left/top) child along the split axis
+    pub first_cells: usize,
+    /// Number of cells in the second (right/bottom) child along the split axis
+    pub second_cells: usize,
 }
 
 fn is_pane(pane: &Arc<dyn Pane>, other: &Option<&Arc<dyn Pane>>) -> bool {
@@ -1362,6 +1366,14 @@ impl TabInner {
                             node.height() as usize
                         } else {
                             node.width() as usize
+                        },
+                        first_cells: match node.direction {
+                            SplitDirection::Horizontal => node.first.cols as usize,
+                            SplitDirection::Vertical => node.first.rows as usize,
+                        },
+                        second_cells: match node.direction {
+                            SplitDirection::Horizontal => node.second.cols as usize,
+                            SplitDirection::Vertical => node.second.rows as usize,
                         },
                     })
                 }

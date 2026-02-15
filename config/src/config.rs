@@ -182,6 +182,9 @@ pub struct Config {
     #[dynamic(default = "default_pane_select_bg_color")]
     pub pane_select_bg_color: RgbaColor,
 
+    #[dynamic(default = "default_true")]
+    pub show_split_size_indicator: bool,
+
     #[dynamic(default = "default_pane_header_active_fg_color")]
     pub pane_header_active_fg_color: RgbaColor,
 
