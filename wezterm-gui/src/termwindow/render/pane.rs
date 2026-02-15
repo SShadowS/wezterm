@@ -305,8 +305,7 @@ impl crate::TermWindow {
 
         // Render pane header if one is set
         let header_top_offset = if let Some(header_text) = pos.pane.get_header() {
-            let header_text =
-                self.call_format_pane_header(pos, &header_text, &config);
+            let header_text = self.call_format_pane_header(pos, &header_text, &config);
 
             let (header_fg_rgba, header_bg_rgba) = if pos.is_active {
                 (
@@ -322,11 +321,9 @@ impl crate::TermWindow {
             let header_fg_linear = header_fg_rgba.to_linear();
             let header_bg_linear = header_bg_rgba.to_linear();
 
-            let left_pixel_x = padding_left
-                + border.left.get() as f32
-                + (pos.left as f32 * cell_width);
-            let header_y =
-                top_pixel_y + (pos.top as f32 * cell_height);
+            let left_pixel_x =
+                padding_left + border.left.get() as f32 + (pos.left as f32 * cell_width);
+            let header_y = top_pixel_y + (pos.top as f32 * cell_height);
 
             // Draw header background
             self.filled_rectangle(
@@ -701,10 +698,8 @@ impl crate::TermWindow {
                 match &v {
                     mlua::Value::Nil => Ok(None),
                     mlua::Value::Table(_) => {
-                        let items =
-                            <Vec<termwiz_funcs::FormatItem>>::from_lua(v, &*lua)?;
-                        let esc =
-                            termwiz_funcs::format_as_escapes(items)?;
+                        let items = <Vec<termwiz_funcs::FormatItem>>::from_lua(v, &*lua)?;
+                        let esc = termwiz_funcs::format_as_escapes(items)?;
                         Ok(Some(esc))
                     }
                     _ => {

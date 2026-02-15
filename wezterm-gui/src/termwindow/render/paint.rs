@@ -272,6 +272,8 @@ impl crate::TermWindow {
         self.paint_window_borders(&mut layers)
             .context("paint_window_borders")?;
         drop(layers);
+        self.paint_split_drag_indicator()
+            .context("paint_split_drag_indicator")?;
         self.paint_modal().context("paint_modal")?;
 
         Ok(())

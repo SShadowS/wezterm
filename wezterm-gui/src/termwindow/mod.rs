@@ -3110,6 +3110,16 @@ impl TermWindow {
                     RotationDirection::CounterClockwise => tab.rotate_counter_clockwise(),
                 }
             }
+            SetTabLayout(layout_name) => {
+                let mux = Mux::get();
+                let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
+                    Some(tab) => tab,
+                    None => return Ok(PerformAssignmentResult::Handled),
+                };
+                if let Err(err) = tab.apply_layout(layout_name) {
+                    log::error!("apply_layout({layout_name}): {err}");
+                }
+            }
             SplitPane(split) => {
                 log::trace!("SplitPane {:?}", split);
                 self.spawn_command(

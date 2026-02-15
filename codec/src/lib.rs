@@ -502,6 +502,7 @@ pdu! {
     GetPaneDirection: 60,
     GetPaneDirectionResponse: 61,
     AdjustPaneSize: 62,
+    SetTabLayout: 63,
 }
 
 impl Pdu {
@@ -874,6 +875,12 @@ pub struct AdjustPaneSize {
     pub pane_id: PaneId,
     pub direction: PaneDirection,
     pub amount: usize,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Debug)]
+pub struct SetTabLayout {
+    pub pane_id: PaneId,
+    pub layout_name: String,
 }
 
 #[derive(Deserialize, Serialize, PartialEq, Debug)]

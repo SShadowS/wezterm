@@ -987,6 +987,38 @@ impl SessionHandler {
                 .detach();
             }
 
+            Pdu::SetTabLayout(SetTabLayout {
+                pane_id,
+                layout_name,
+            }) => {
+                spawn_into_main_thread(async move {
+                    catch(
+                        move || {
+                            let mux = Mux::get();
+                            let (_pane_domain_id, _window_id, tab_id) = mux
+                                .resolve_pane_id(pane_id)
+                                .ok_or_else(|| anyhow!("pane_id {} invalid", pane_id))?;
+
+                            let tab = match mux.get_tab(tab_id) {
+                                Some(tab) => tab,
+                                None => {
+                                    return Err(anyhow!(
+                                        "Failed to retrieve tab with ID {}",
+                                        tab_id
+                                    ))
+                                }
+                            };
+
+                            tab.apply_layout(&layout_name)
+                                .map_err(|e| anyhow!("{}", e))?;
+                            Ok(Pdu::UnitResponse(UnitResponse {}))
+                        },
+                        send_response,
+                    )
+                })
+                .detach();
+            }
+
             Pdu::Invalid { .. } => send_response(Err(anyhow!("invalid PDU {:?}", decoded.pdu))),
             Pdu::Pong { .. }
             | Pdu::ListPanesResponse { .. }

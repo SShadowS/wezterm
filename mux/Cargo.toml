@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 anyhow.workspace = true
+async-channel.workspace = true
 async-trait.workspace = true
 base64.workspace = true
 bintree.workspace = true
@@ -36,6 +37,7 @@ procinfo.workspace = true
 promise.workspace = true
 rangeset.workspace = true
 serde = {workspace=true, features = ["rc", "derive"]}
+serde_json.workspace = true
 serial2.workspace = true
 shell-words.workspace = true
 smol.workspace = true
@@ -48,6 +50,9 @@ url.workspace = true
 wezterm-dynamic.workspace = true
 wezterm-ssh.workspace = true
 wezterm-term = { workspace=true, features=["use_serde"] }
+wezterm-uds.workspace = true
+async-io.workspace = true
+futures.workspace = true
 
 [target."cfg(windows)".dependencies]
 ntapi.workspace = true

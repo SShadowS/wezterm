@@ -1,0 +1,10 @@
+[package]
+name = "env-shim"
+version = "0.1.0"
+authors = ["Wez Furlong <wez@wezfurlong.org>"]
+edition = "2018"
+publish = false
+
+[[bin]]
+name = "env"
+path = "src/main.rs"

@@ -203,6 +203,10 @@ pub struct PositionedSplit {
     /// For Horizontal splits, how tall the split should be, for Vertical
     /// splits how wide it should be
     pub size: usize,
+    /// Number of cells in the first (left/top) child along the split axis
+    pub first_cells: usize,
+    /// Number of cells in the second (right/bottom) child along the split axis
+    pub second_cells: usize,
 }
 
 fn is_pane(pane: &Arc<dyn Pane>, other: &Option<&Arc<dyn Pane>>) -> bool {
@@ -520,6 +524,133 @@ fn cell_dimensions(size: &TerminalSize) -> TerminalSize {
     }
 }
 
+/// Split a `TerminalSize` into two parts along the given direction.
+/// `first_parts` of `total_parts` go to the first half; the remainder goes
+/// to the second half.  One cell/row is reserved for the split separator
+/// between each part at the top level (i.e. `total_parts - 1` separators
+/// worth of space is subtracted from the usable area).
+fn split_size_evenly(
+    size: &TerminalSize,
+    direction: SplitDirection,
+    first_parts: usize,
+    total_parts: usize,
+) -> (TerminalSize, TerminalSize) {
+    match direction {
+        SplitDirection::Horizontal => {
+            // Horizontal splits divide columns (panes side-by-side)
+            let total_cols = size.cols;
+            let separator = 1usize;
+            let usable = total_cols.saturating_sub(total_parts.saturating_sub(1) * separator);
+            let first_cols = (usable * first_parts / total_parts).max(1);
+            let second_cols = total_cols.saturating_sub(first_cols + separator).max(1);
+            let pw = if size.cols > 0 {
+                size.pixel_width / size.cols
+            } else {
+                0
+            };
+            (
+                TerminalSize {
+                    cols: first_cols,
+                    pixel_width: first_cols * pw,
+                    ..*size
+                },
+                TerminalSize {
+                    cols: second_cols,
+                    pixel_width: second_cols * pw,
+                    ..*size
+                },
+            )
+        }
+        SplitDirection::Vertical => {
+            // Vertical splits divide rows (panes stacked top/bottom)
+            let total_rows = size.rows;
+            let separator = 1usize;
+            let usable = total_rows.saturating_sub(total_parts.saturating_sub(1) * separator);
+            let first_rows = (usable * first_parts / total_parts).max(1);
+            let second_rows = total_rows.saturating_sub(first_rows + separator).max(1);
+            let ph = if size.rows > 0 {
+                size.pixel_height / size.rows
+            } else {
+                0
+            };
+            (
+                TerminalSize {
+                    rows: first_rows,
+                    pixel_height: first_rows * ph,
+                    ..*size
+                },
+                TerminalSize {
+                    rows: second_rows,
+                    pixel_height: second_rows * ph,
+                    ..*size
+                },
+            )
+        }
+    }
+}
+
+/// Build a right-leaning chain of splits from a slice of panes.
+/// The first pane occupies 1/n of the space along `direction`, the second
+/// pane occupies 1/(n-1) of the remainder, and so on.
+fn build_chain_tree(
+    panes: &[Arc<dyn Pane>],
+    direction: SplitDirection,
+    size: &TerminalSize,
+) -> Tree {
+    assert!(!panes.is_empty());
+    if panes.len() == 1 {
+        return Tree::Leaf(panes[0].clone());
+    }
+
+    let n = panes.len();
+    // First pane gets 1/n of the space; rest share the remainder.
+    let (first_size, second_size) = split_size_evenly(size, direction, 1, n);
+
+    let left = Tree::Leaf(panes[0].clone());
+    let right = build_chain_tree(&panes[1..], direction, &second_size);
+
+    Tree::Node {
+        left: Box::new(left),
+        right: Box::new(right),
+        data: Some(SplitDirectionAndSize {
+            direction,
+            first: first_size,
+            second: second_size,
+        }),
+    }
+}
+
+/// Build a right-leaning chain from a `Vec` of already-constructed sub-trees
+/// along the given `direction`, splitting the available space evenly.
+/// Takes ownership of the trees to avoid requiring `Clone` on `Tree`.
+fn build_tree_chain_from_vec(
+    mut trees: Vec<Tree>,
+    direction: SplitDirection,
+    size: &TerminalSize,
+) -> Tree {
+    assert!(!trees.is_empty());
+    if trees.len() == 1 {
+        return trees.remove(0);
+    }
+
+    let n = trees.len();
+    let (first_size, second_size) = split_size_evenly(size, direction, 1, n);
+
+    // Pop the first tree and recurse on the rest.
+    let first = trees.remove(0);
+    let rest = build_tree_chain_from_vec(trees, direction, &second_size);
+
+    Tree::Node {
+        left: Box::new(first),
+        right: Box::new(rest),
+        data: Some(SplitDirectionAndSize {
+            direction,
+            first: first_size,
+            second: second_size,
+        }),
+    }
+}
+
 impl Tab {
     pub fn new(size: &TerminalSize) -> Self {
         let inner = TabInner::new(size);
@@ -601,6 +732,13 @@ impl Tab {
 
     pub fn rotate_clockwise(&self) {
         self.inner.lock().rotate_clockwise()
+    }
+
+    /// Rearrange all panes in this tab according to a named layout preset.
+    /// Supported layout names: "even-horizontal", "even-vertical",
+    /// "main-vertical", "main-horizontal", "tiled".
+    pub fn apply_layout(&self, layout_name: &str) -> Result<(), String> {
+        self.inner.lock().apply_layout(layout_name)
     }
 
     pub fn iter_splits(&self) -> Vec<PositionedSplit> {
@@ -1014,6 +1152,106 @@ impl TabInner {
         Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
     }
 
+    /// Rearrange panes according to a named tmux layout preset.
+    fn apply_layout(&mut self, layout_name: &str) -> Result<(), String> {
+        let panes = self.iter_panes_ignoring_zoom();
+        if panes.len() <= 1 {
+            return Ok(());
+        }
+        let pane_list: Vec<Arc<dyn Pane>> = panes.into_iter().map(|p| p.pane).collect();
+
+        let new_tree = match layout_name {
+            "even-horizontal" => {
+                build_chain_tree(&pane_list, SplitDirection::Horizontal, &self.size)
+            }
+            "even-vertical" => build_chain_tree(&pane_list, SplitDirection::Vertical, &self.size),
+            "main-vertical" => {
+                // First pane gets ~50% width on the left; remaining panes
+                // are stacked vertically on the right.
+                let (left_size, right_size) =
+                    split_size_evenly(&self.size, SplitDirection::Horizontal, 1, 2);
+                let left = Tree::Leaf(pane_list[0].clone());
+                let right =
+                    build_chain_tree(&pane_list[1..], SplitDirection::Vertical, &right_size);
+                Tree::Node {
+                    left: Box::new(left),
+                    right: Box::new(right),
+                    data: Some(SplitDirectionAndSize {
+                        direction: SplitDirection::Horizontal,
+                        first: left_size,
+                        second: right_size,
+                    }),
+                }
+            }
+            "main-horizontal" => {
+                // First pane gets ~50% height on top; remaining panes
+                // are arranged side-by-side on the bottom.
+                let (top_size, bottom_size) =
+                    split_size_evenly(&self.size, SplitDirection::Vertical, 1, 2);
+                let top = Tree::Leaf(pane_list[0].clone());
+                let bottom =
+                    build_chain_tree(&pane_list[1..], SplitDirection::Horizontal, &bottom_size);
+                Tree::Node {
+                    left: Box::new(top),
+                    right: Box::new(bottom),
+                    data: Some(SplitDirectionAndSize {
+                        direction: SplitDirection::Vertical,
+                        first: top_size,
+                        second: bottom_size,
+                    }),
+                }
+            }
+            "tiled" => {
+                // Grid layout: compute rows/cols so the grid is as square as
+                // possible, then build V(row1, V(row2, ...)) where each row
+                // is H(p1, H(p2, ...)).
+                let n = pane_list.len();
+                let num_rows = (n as f64).sqrt().ceil() as usize;
+                let num_cols = (n + num_rows - 1) / num_rows;
+
+                // Build each row as a horizontal chain, then stack rows
+                // vertically.
+                let mut row_trees: Vec<Tree> = Vec::new();
+                let mut remaining = &pane_list[..];
+                let row_size = {
+                    let (first_row_size, _) =
+                        split_size_evenly(&self.size, SplitDirection::Vertical, 1, num_rows);
+                    first_row_size
+                };
+
+                for row_idx in 0..num_rows {
+                    let panes_in_row = if row_idx < num_rows - 1 {
+                        num_cols.min(remaining.len())
+                    } else {
+                        remaining.len()
+                    };
+                    if panes_in_row == 0 {
+                        break;
+                    }
+                    let (row_panes, rest) = remaining.split_at(panes_in_row);
+                    remaining = rest;
+                    row_trees.push(build_chain_tree(
+                        row_panes,
+                        SplitDirection::Horizontal,
+                        &row_size,
+                    ));
+                }
+
+                // Stack rows into a vertical chain (right-leaning).
+                build_tree_chain_from_vec(row_trees, SplitDirection::Vertical, &self.size)
+            }
+            _ => {
+                return Err(format!("unknown layout name: {}", layout_name));
+            }
+        };
+
+        self.pane = Some(new_tree);
+        let size = self.size;
+        apply_sizes_from_splits(self.pane.as_mut().unwrap(), &size);
+        Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.id)));
+        Ok(())
+    }
+
     fn iter_panes_impl(&mut self, respect_zoom_state: bool) -> Vec<PositionedPane> {
         let mut panes = vec![];
 
@@ -1128,6 +1366,14 @@ impl TabInner {
                             node.height() as usize
                         } else {
                             node.width() as usize
+                        },
+                        first_cells: match node.direction {
+                            SplitDirection::Horizontal => node.first.cols as usize,
+                            SplitDirection::Vertical => node.first.rows as usize,
+                        },
+                        second_cells: match node.direction {
+                            SplitDirection::Horizontal => node.second.cols as usize,
+                            SplitDirection::Vertical => node.second.rows as usize,
                         },
                     })
                 }

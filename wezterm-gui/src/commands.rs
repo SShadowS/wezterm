@@ -1980,6 +1980,14 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
                 RotationDirection::CounterClockwise => "md_rotate_left",
             }),
         },
+        SetTabLayout(layout_name) => CommandDef {
+            brief: format!("Set tab layout to {layout_name}").into(),
+            doc: format!("Rearrange panes in the current tab using the '{layout_name}' layout").into(),
+            keys: vec![],
+            args: &[ArgType::ActivePane],
+            menubar: &["Window", "Set Tab Layout"],
+            icon: Some("md_grid_view"),
+        },
         SplitPane(split) => {
             let direction = split.direction;
             CommandDef {
@@ -2099,6 +2107,11 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         }),
         RotatePanes(RotationDirection::Clockwise),
         RotatePanes(RotationDirection::CounterClockwise),
+        SetTabLayout("even-horizontal".to_string()),
+        SetTabLayout("even-vertical".to_string()),
+        SetTabLayout("main-horizontal".to_string()),
+        SetTabLayout("main-vertical".to_string()),
+        SetTabLayout("tiled".to_string()),
         ActivateTab(0),
         ActivateTab(1),
         ActivateTab(2),

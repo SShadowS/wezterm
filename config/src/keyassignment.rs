@@ -633,6 +633,7 @@ pub enum KeyAssignment {
 
     CopyMode(CopyModeAssignment),
     RotatePanes(RotationDirection),
+    SetTabLayout(String),
     SplitPane(SplitPane),
     PaneSelect(PaneSelectArguments),
     CharSelect(CharSelectArguments),

@@ -182,6 +182,9 @@ pub struct Config {
     #[dynamic(default = "default_pane_select_bg_color")]
     pub pane_select_bg_color: RgbaColor,
 
+    #[dynamic(default = "default_true")]
+    pub show_split_size_indicator: bool,
+
     #[dynamic(default = "default_pane_header_active_fg_color")]
     pub pane_header_active_fg_color: RgbaColor,
 
@@ -533,6 +536,14 @@ pub struct Config {
     pub enable_wayland: bool,
     #[dynamic(default)]
     pub enable_zwlr_output_manager: bool,
+
+    /// Enable tmux control mode compatibility server.
+    /// When enabled, WezTerm starts a CC protocol server on a Unix socket
+    /// and sets environment variables (TMUX, PATH) in spawned shells so that
+    /// tools like Claude Code can use tmux commands natively.
+    /// The default is false.
+    #[dynamic(default)]
+    pub enable_tmux_compat: bool,
 
     /// Whether to prefer EGL over other GL implementations.
     /// EGL on Windows has jankier resize behavior than WGL (which

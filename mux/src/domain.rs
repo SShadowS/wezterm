@@ -483,6 +483,47 @@ impl LocalDomain {
         if let Some(agent) = Mux::get().agent.as_ref() {
             cmd.env("SSH_AUTH_SOCK", agent.path());
         }
+        // Tmux compat: forward CC socket path and set TMUX + PATH
+        if config.enable_tmux_compat {
+            if let Ok(tmux_cc) = std::env::var("WEZTERM_TMUX_CC") {
+                cmd.env("WEZTERM_TMUX_CC", &tmux_cc);
+                // Set TMUX so tools auto-detect tmux mode.
+                // Format: socket_path,pid,session (matches real tmux convention)
+                let tmux_val = format!("{},{},0", tmux_cc, std::process::id());
+                log::debug!("tmux compat: setting TMUX={}", tmux_val);
+                cmd.env("TMUX", &tmux_val);
+                // Prepend the tmux shim directory to PATH so our shim shadows real tmux
+                if let Ok(our_exe) = std::env::current_exe() {
+                    if let Some(exe_dir) = our_exe.parent() {
+                        let shim_dir = exe_dir.join("tmux-compat");
+                        if shim_dir.exists() {
+                            let sep = if cfg!(windows) { ";" } else { ":" };
+                            let current_path = cmd
+                                .get_env("PATH")
+                                .map(|p| p.to_string_lossy().into_owned())
+                                .or_else(|| std::env::var("PATH").ok())
+                                .unwrap_or_default();
+                            cmd.env(
+                                "PATH",
+                                format!("{}{}{}", shim_dir.display(), sep, current_path),
+                            );
+                            log::debug!("tmux compat: prepended {} to PATH", shim_dir.display());
+                        } else {
+                            log::warn!(
+                                "tmux compat: shim directory {} does not exist, \
+                                 tmux shim will not be on PATH",
+                                shim_dir.display()
+                            );
+                        }
+                    }
+                }
+            } else {
+                log::warn!(
+                    "tmux compat enabled but WEZTERM_TMUX_CC not set; \
+                     CC server may have failed to start"
+                );
+            }
+        }
         self.fixup_command(&mut cmd).await?;
         Ok(cmd)
     }
