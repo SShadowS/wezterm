@@ -11,7 +11,7 @@ __      __      _____                ___
 
 <br/>
 
-[![License](https://img.shields.io/github/license/SShadowS/wezterm?style=flat-square)](LICENSE.md)
+[![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE.md)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue?style=flat-square)
 ![Language](https://img.shields.io/badge/language-Rust-orange?style=flat-square)
 [![Upstream](https://img.shields.io/badge/upstream-wezterm%2Fwezterm-lightgrey?style=flat-square)](https://github.com/wezterm/wezterm)
