@@ -1,14 +1,37 @@
-# WezTerm Evo
+<div align="center">
 
-**WezTerm fork evolved for AI-native terminal workflows.**
+<pre>
+__      __      _____                ___         
+\ \    / /__ __|_   _|__ _ _ _ __   | __|_ _____ 
+ \ \/\/ / -_)_ / | |/ -_) '_| '  \  | _|\ V / _ \
+  \_/\_/\___/__| |_|\___|_| |_|_|_| |___|\_/\___/
+</pre>
 
-A GPU-accelerated cross-platform terminal emulator forked from [wezterm/wezterm](https://github.com/wezterm/wezterm), enhanced specifically for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and its Agent Team feature.
+<em>A GPU-accelerated cross-platform terminal emulator, evolved for AI-native workflows.</em>
 
+<br/>
+
+[![License](https://img.shields.io/github/license/SShadowS/wezterm?style=flat-square)](LICENSE.md)
+![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue?style=flat-square)
+![Language](https://img.shields.io/badge/language-Rust-orange?style=flat-square)
+[![Upstream](https://img.shields.io/badge/upstream-wezterm%2Fwezterm-lightgrey?style=flat-square)](https://github.com/wezterm/wezterm)
+
+<br/>
+
+**44** tmux commands · **10** notifications · **36** format variables · **5** layout modes
+
+</div>
+
+---
+
+A WezTerm fork enhanced specifically for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and its Agent Team feature.
 For upstream documentation and general WezTerm usage, see [wezterm.org](https://wezterm.org/).
 
-## Key Features
+---
 
-### Claude Code Agent Team Integration
+## 🚀 Key Features
+
+### 🤖 Claude Code Agent Team Integration
 
 WezTerm Evo includes a full **tmux CC (Control-Client) protocol server** that lets Claude Code agents manage terminal panes natively using standard tmux commands — no actual tmux installation required.
 
@@ -18,7 +41,7 @@ WezTerm Evo includes a full **tmux CC (Control-Client) protocol server** that le
 - **Tmux-compat shim binary** (`tmux-compat-shim/`) — drop-in `tmux` executable so Claude agents use familiar `tmux` commands that route to WezTerm's CC server
 - **`env` shim for Windows** (`env-shim/`) — emulates the Unix `env` command (`KEY=VAL command args...`, `-i`, `-u`) so cross-platform scripts just work
 
-### Per-Pane Header Bars
+### 🏷️ Per-Pane Header Bars
 
 Optional 1-row colored headers at the top of each pane, useful for identifying agent panes in split layouts.
 
@@ -26,9 +49,12 @@ Optional 1-row colored headers at the top of each pane, useful for identifying a
 - **Format callback**: `format-pane-header` event (works like `format-tab-title`)
 - **Config colors**: `pane_header_active_fg_color`, `pane_header_active_bg_color`, `pane_header_inactive_fg_color`, `pane_header_inactive_bg_color`
 
-### Tab Layout System
+### 📐 Tab Layout System
 
 Switch between tmux-style layouts via Lua, CLI, or keybinding:
+
+<details>
+<summary><strong>Layout modes & usage examples</strong></summary>
 
 | Layout | Description |
 |--------|-------------|
@@ -48,11 +74,13 @@ Switch between tmux-style layouts via Lua, CLI, or keybinding:
 wezterm cli set-tab-layout tiled
 ```
 
-### Split Divider Percentage Indicator
+</details>
+
+### 📏 Split Divider Percentage Indicator
 
 A floating percentage label appears centered on the divider while dragging splits, giving precise visual feedback on pane sizing. Controlled by `show_split_size_indicator` (default: `true`).
 
-### All Upstream WezTerm Features
+### ⚡ All Upstream WezTerm Features
 
 Everything from upstream WezTerm is preserved:
 
@@ -65,7 +93,9 @@ Everything from upstream WezTerm is preserved:
 
 See the full feature list at [wezterm.org](https://wezterm.org/).
 
-## Quick Start
+---
+
+## 🏁 Quick Start
 
 ### Building from Source
 
@@ -88,9 +118,11 @@ For upstream installation and platform-specific instructions, see the [WezTerm i
 
 Place the built `tmux` shim binary on your `PATH` (before any real tmux, if installed). Claude Code agents will then use standard `tmux` commands that automatically route through WezTerm's CC protocol server.
 
-The shim reads the `WEZTERM_TMUX_CC` environment variable for the socket path.
+> 💡 **Tip:** The shim reads the `WEZTERM_TMUX_CC` environment variable for the socket path. Make sure this is set in your shell profile for seamless agent integration.
 
-## Configuration
+---
+
+## ⚙️ Configuration
 
 Fork-specific options in your `.wezterm.lua`:
 
@@ -107,8 +139,10 @@ config.pane_header_inactive_bg_color = "#333333"
 config.show_split_size_indicator = true  -- default
 ```
 
-All standard WezTerm configuration options continue to work as documented at [wezterm.org/config](https://wezterm.org/docs/config/lua/config/).
+> 💡 **Tip:** All standard WezTerm configuration options continue to work as documented at [wezterm.org/config](https://wezterm.org/docs/config/lua/config/).
 
-## Acknowledgments
+---
+
+## 🙏 Acknowledgments
 
 This project is built on top of [wezterm/wezterm](https://github.com/wezterm/wezterm) by Wez Furlong and contributors. All credit for the core terminal emulator, GPU rendering pipeline, multiplexer architecture, Lua config system, and cross-platform windowing goes to the upstream project.
