@@ -16,6 +16,7 @@ mod move_pane_to_new_tab;
 mod proxy;
 mod rename_workspace;
 mod send_text;
+mod set_tab_layout;
 mod set_tab_title;
 mod set_window_title;
 mod spawn_command;
@@ -144,6 +145,10 @@ Outputs the pane-id for the newly created pane on success"
     #[command(name = "adjust-pane-size", rename_all = "kebab")]
     AdjustPaneSize(adjust_pane_size::CliAdjustPaneSize),
 
+    /// Apply a named layout to the panes in the current tab
+    #[command(name = "set-tab-layout", rename_all = "kebab")]
+    SetTabLayout(set_tab_layout::CliSetTabLayout),
+
     /// Activate a tab
     #[command(name = "activate-tab", rename_all = "kebab")]
     ActivateTab(activate_tab::ActivateTab),
@@ -194,6 +199,7 @@ async fn run_cli_async(opts: &crate::Opt, cli: CliCommand) -> anyhow::Result<()>
         CliSubCommand::KillPane(cmd) => cmd.run(client).await,
         CliSubCommand::ActivatePane(cmd) => cmd.run(client).await,
         CliSubCommand::AdjustPaneSize(cmd) => cmd.run(client).await,
+        CliSubCommand::SetTabLayout(cmd) => cmd.run(client).await,
         CliSubCommand::ActivateTab(cmd) => cmd.run(client).await,
         CliSubCommand::SetTabTitle(cmd) => cmd.run(client).await,
         CliSubCommand::SetWindowTitle(cmd) => cmd.run(client).await,

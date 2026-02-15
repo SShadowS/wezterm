@@ -124,6 +124,14 @@ impl UserData for MuxTab {
             Ok(())
         });
 
+        methods.add_method("set_layout", |_, this, layout_name: String| {
+            let mux = get_mux()?;
+            let tab = this.resolve(&mux)?;
+            tab.apply_layout(&layout_name)
+                .map_err(|e| mlua::Error::external(e))?;
+            Ok(())
+        });
+
         methods.add_method("get_size", |lua, this, _: ()| {
             let mux = get_mux()?;
             let tab = this.resolve(&mux)?;
