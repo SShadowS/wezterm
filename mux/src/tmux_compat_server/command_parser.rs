@@ -197,6 +197,9 @@ pub enum TmuxCliCommand {
     PipePane {
         target: Option<String>,
         command: Option<String>,
+        output: bool,
+        input: bool,
+        toggle: bool,
     },
     DisplayPopup {
         target: Option<String>,
@@ -1169,7 +1172,10 @@ fn parse_copy_mode(args: &[String]) -> Result<TmuxCliCommand> {
         match arg {
             "-q" => quit = true,
             "-t" => target = Some(take_flag_value("-t", &mut iter)?),
-            "-e" | "-H" | "-M" | "-u" => {} // accept but ignore
+            "-s" => {
+                let _ = take_flag_value("-s", &mut iter)?;
+            }
+            "-d" | "-e" | "-H" | "-M" | "-S" | "-u" => {} // accept but ignore
             other => bail!("copy-mode: unexpected argument: {other:?}"),
         }
     }
@@ -1296,22 +1302,36 @@ fn parse_wait_for(args: &[String]) -> Result<TmuxCliCommand> {
 fn parse_pipe_pane(args: &[String]) -> Result<TmuxCliCommand> {
     let mut target = None;
     let mut command = None;
+    let mut output = false;
+    let mut input = false;
+    let mut toggle = false;
 
     let strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     let mut iter = strs.iter().copied();
     while let Some(arg) = iter.next() {
         match arg {
             "-t" => target = Some(take_flag_value("-t", &mut iter)?),
-            "-o" | "-O" | "-I" => {
-                // Accept but ignore output/input flags
-            }
+            "-O" => output = true,
+            "-I" => input = true,
+            "-o" => toggle = true,
             _ => {
                 command = Some(arg.to_string());
             }
         }
     }
 
-    Ok(TmuxCliCommand::PipePane { target, command })
+    // Default: if neither -I nor -O specified, output mode is implied
+    if !input && !output {
+        output = true;
+    }
+
+    Ok(TmuxCliCommand::PipePane {
+        target,
+        command,
+        output,
+        input,
+        toggle,
+    })
 }
 
 fn parse_display_popup(args: &[String]) -> Result<TmuxCliCommand> {
@@ -1322,14 +1342,14 @@ fn parse_display_popup(args: &[String]) -> Result<TmuxCliCommand> {
     while let Some(arg) = iter.next() {
         match arg {
             "-t" => target = Some(take_flag_value("-t", &mut iter)?),
-            // Accept and ignore all other flags with values
-            "-d" | "-e" | "-h" | "-w" | "-x" | "-y" | "-s" | "-S" | "-T" | "-B" | "-b" | "-C" => {
+            // Flags that take a value (display-popup + display-menu union)
+            "-b" | "-c" | "-d" | "-e" | "-h" | "-w" | "-x" | "-y" | "-s" | "-S" | "-T" | "-H" => {
                 let _ = take_flag_value(arg, &mut iter)?;
             }
-            // Flags without values
-            "-E" | "-EE" => {}
+            // Boolean flags (no value)
+            "-B" | "-C" | "-E" | "-k" | "-M" | "-N" | "-O" => {}
             _ => {
-                // Remaining args are the popup command — ignore
+                // Remaining args are the popup/menu command — ignore
             }
         }
     }
@@ -2682,6 +2702,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn copy_mode_all_flags() {
+        // All valid tmux copy-mode flags: -d, -e, -H, -M, -q, -S, -s (value), -t (value), -u
+        assert_eq!(
+            parse("copy-mode -d -s %3 -S -e -H -M -u -q -t %5"),
+            TmuxCliCommand::CopyMode {
+                quit: true,
+                target: Some("%5".into()),
+            }
+        );
+    }
+
     // ---------------------------------------------------------------
     // Phase 13: Claude Code agent teams compatibility
     // ---------------------------------------------------------------
@@ -3164,6 +3196,9 @@ mod tests {
             TmuxCliCommand::PipePane {
                 target: Some("%3".into()),
                 command: Some("cat >> /tmp/log".into()),
+                output: true,
+                input: false,
+                toggle: false,
             }
         );
     }
@@ -3175,6 +3210,9 @@ mod tests {
             TmuxCliCommand::PipePane {
                 target: None,
                 command: None,
+                output: true,
+                input: false,
+                toggle: false,
             }
         );
     }
@@ -3186,6 +3224,37 @@ mod tests {
             TmuxCliCommand::PipePane {
                 target: Some("%1".into()),
                 command: None,
+                output: true,
+                input: false,
+                toggle: false,
+            }
+        );
+    }
+
+    #[test]
+    fn phase17_pipe_pane_input_output() {
+        assert_eq!(
+            parse("pipe-pane -I -O -t %2 \"tee /tmp/log\""),
+            TmuxCliCommand::PipePane {
+                target: Some("%2".into()),
+                command: Some("tee /tmp/log".into()),
+                output: true,
+                input: true,
+                toggle: false,
+            }
+        );
+    }
+
+    #[test]
+    fn phase17_pipe_pane_toggle() {
+        assert_eq!(
+            parse("pipe-pane -o -t %0 \"cat >> /tmp/log\""),
+            TmuxCliCommand::PipePane {
+                target: Some("%0".into()),
+                command: Some("cat >> /tmp/log".into()),
+                output: true,
+                input: false,
+                toggle: true,
             }
         );
     }
@@ -3214,6 +3283,35 @@ mod tests {
             parse("display-popup -w 80 -h 24 -d /tmp -t %2 echo hello"),
             TmuxCliCommand::DisplayPopup {
                 target: Some("%2".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn phase17_display_menu_basic() {
+        assert_eq!(
+            parse("display-menu -t %1 -T title -x 10 -y 5"),
+            TmuxCliCommand::DisplayPopup {
+                target: Some("%1".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn phase17_menu_alias() {
+        assert_eq!(
+            parse("menu -T test -x 0 -y 0"),
+            TmuxCliCommand::DisplayPopup { target: None }
+        );
+    }
+
+    #[test]
+    fn phase17_display_popup_boolean_b_flag() {
+        // -B should be boolean (no value), not consume the next arg
+        assert_eq!(
+            parse("display-popup -B -t %0"),
+            TmuxCliCommand::DisplayPopup {
+                target: Some("%0".into()),
             }
         );
     }

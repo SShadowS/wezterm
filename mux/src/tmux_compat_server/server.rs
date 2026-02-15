@@ -321,8 +321,9 @@ pub fn translate_notification(
         }
 
         MuxNotification::PaneRemoved(pane_id) => {
-            // Clean up id_map, but don't emit a separate notification.
+            // Clean up pipe-pane and id_map, but don't emit a separate notification.
             // The layout-change from TabResized covers the visual change.
+            super::handlers::close_pipe_pane(pane_id);
             session.ctx.id_map.remove_pane(pane_id);
             None
         }
@@ -648,7 +649,7 @@ fn process_cc_connection_sync(
 
         // If detach was requested, send %exit and close the connection.
         if session.ctx.detach_requested {
-            let exit = exit_notification(None);
+            let exit = exit_notification(session.ctx.detach_reason.as_deref());
             std::io::Write::write_all(&mut stream, exit.as_bytes())?;
             std::io::Write::flush(&mut stream)?;
             log::info!("tmux CC: client detached");

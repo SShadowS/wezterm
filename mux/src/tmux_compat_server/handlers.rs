@@ -42,6 +42,32 @@ struct WaitChannel {
 static WAIT_CHANNELS: LazyLock<ParkMutex<HashMap<String, WaitChannel>>> =
     LazyLock::new(Default::default);
 
+// ---------------------------------------------------------------------------
+// Pipe-pane infrastructure
+// ---------------------------------------------------------------------------
+
+/// Handle to a running pipe-pane child process and its shutdown channel.
+struct PipePaneHandle {
+    child: std::process::Child,
+    shutdown_tx: async_channel::Sender<()>,
+}
+
+/// Global pipe-pane state, keyed by WezTerm pane ID.
+static PIPE_PANE_STATE: LazyLock<ParkMutex<HashMap<PaneId, PipePaneHandle>>> =
+    LazyLock::new(Default::default);
+
+/// Close (and clean up) any active pipe-pane for the given WezTerm pane.
+pub fn close_pipe_pane(pane_id: PaneId) {
+    let mut state = PIPE_PANE_STATE.lock();
+    if let Some(mut handle) = state.remove(&pane_id) {
+        // Signal shutdown to the feeder threads
+        let _ = handle.shutdown_tx.try_send(());
+        // Kill the child process
+        let _ = handle.child.kill();
+        let _ = handle.child.wait();
+    }
+}
+
 /// Resolved WezTerm IDs from a tmux target specification.
 #[derive(Debug, Default)]
 pub struct ResolvedTarget {
@@ -92,6 +118,8 @@ pub struct HandlerContext {
     pub pending_notifications: Vec<String>,
     /// Set by `detach-client` to signal the server loop to close.
     pub detach_requested: bool,
+    /// Optional reason sent with `%exit` when detaching (e.g. "server killed").
+    pub detach_reason: Option<String>,
     /// Last-known active tab per mux window, for `%session-window-changed` detection.
     pub last_active_tab: HashMap<WindowId, crate::tab::TabId>,
     /// Suppression counter for `%session-window-changed` — incremented when we
@@ -133,6 +161,7 @@ impl HandlerContext {
             workspace,
             pending_notifications: Vec::new(),
             detach_requested: false,
+            detach_reason: None,
             last_active_tab: HashMap::new(),
             suppress_window_changed: 0,
             client_name: String::new(),
@@ -724,18 +753,15 @@ pub async fn dispatch_command(
             target,
         } => handle_break_pane(ctx, detach, &source, &target).await,
         // Phase 17: missing commands for cleanup & orchestration
-        TmuxCliCommand::KillServer => {
-            ctx.detach_requested = true;
-            Ok(String::new())
-        }
+        TmuxCliCommand::KillServer => handle_kill_server(ctx),
         TmuxCliCommand::WaitFor { signal, channel } => handle_wait_for(signal, &channel).await,
         TmuxCliCommand::PipePane {
-            target: _,
-            command: _,
-        } => {
-            // Stub: output streaming is handled by CC %output notifications
-            Ok(String::new())
-        }
+            target,
+            command,
+            output,
+            input,
+            toggle,
+        } => handle_pipe_pane(ctx, &target, command.as_deref(), output, input, toggle),
         TmuxCliCommand::DisplayPopup { target: _ } => {
             // No-op: GUI popups don't apply to CC mode
             Ok(String::new())
@@ -773,6 +799,7 @@ pub fn handle_list_commands() -> String {
         "copy-mode",
         "delete-buffer",
         "detach-client",
+        "display-menu",
         "display-message",
         "display-popup",
         "has-session",
@@ -869,6 +896,179 @@ pub fn handle_server_info(ctx: &HandlerContext) -> String {
 pub fn handle_copy_mode(_quit: bool) -> Result<String, String> {
     // No-op: WezTerm's copy overlay is independent of tmux CC protocol.
     // iTerm2 sends `copy-mode -q` on connect as a defensive measure.
+    Ok(String::new())
+}
+
+/// Handle `pipe-pane [-I] [-O] [-o] [-t target] [command]`.
+///
+/// Spawns a shell command and pipes pane output to its stdin (`-O`, default)
+/// and/or child stdout to the pane's input (`-I`). With no command, closes
+/// any existing pipe. With `-o` (toggle), does nothing if a pipe already exists.
+fn handle_pipe_pane(
+    ctx: &HandlerContext,
+    target: &Option<String>,
+    command: Option<&str>,
+    output: bool,
+    input: bool,
+    toggle: bool,
+) -> Result<String, String> {
+    let resolved = ctx.resolve_target(target)?;
+    let pane_id = resolved
+        .pane_id
+        .ok_or_else(|| "no pane resolved".to_string())?;
+
+    // No command → close existing pipe
+    let cmd_str = match command {
+        Some(c) if !c.is_empty() => c,
+        _ => {
+            close_pipe_pane(pane_id);
+            return Ok(String::new());
+        }
+    };
+
+    // Toggle mode: if pipe already exists, do nothing
+    if toggle {
+        let state = PIPE_PANE_STATE.lock();
+        if state.contains_key(&pane_id) {
+            return Ok(String::new());
+        }
+    }
+
+    // Close any existing pipe before starting a new one
+    close_pipe_pane(pane_id);
+
+    // Determine shell and flag for the platform
+    #[cfg(windows)]
+    let (shell, shell_flag) = ("cmd.exe", "/C");
+    #[cfg(not(windows))]
+    let (shell, shell_flag) = ("sh", "-c");
+
+    let mut child = std::process::Command::new(shell)
+        .arg(shell_flag)
+        .arg(cmd_str)
+        .stdin(if output {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
+        .stdout(if input {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        })
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("pipe-pane: failed to spawn: {}", e))?;
+
+    let (shutdown_tx, shutdown_rx) = async_channel::bounded::<()>(1);
+
+    // Output mode: tap pane output → child stdin
+    if output {
+        if let Some(child_stdin) = child.stdin.take() {
+            let tap_rx = crate::register_output_tap(pane_id);
+            let shutdown_rx_clone = shutdown_rx.clone();
+            std::thread::Builder::new()
+                .name(format!("pipe-pane-out-{}", pane_id))
+                .spawn(move || {
+                    use std::io::Write;
+                    let mut stdin = child_stdin;
+                    loop {
+                        // Check shutdown
+                        if shutdown_rx_clone.try_recv().is_ok() {
+                            break;
+                        }
+                        match tap_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+                            Ok((data, _ts)) => {
+                                if stdin.write_all(&data).is_err() {
+                                    break;
+                                }
+                                let _ = stdin.flush();
+                            }
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                        }
+                    }
+                })
+                .ok();
+        }
+    }
+
+    // Input mode: child stdout → pane input
+    if input {
+        if let Some(child_stdout) = child.stdout.take() {
+            let shutdown_rx_clone = shutdown_rx.clone();
+            std::thread::Builder::new()
+                .name(format!("pipe-pane-in-{}", pane_id))
+                .spawn(move || {
+                    use std::io::Read;
+                    let mut stdout = child_stdout;
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        if shutdown_rx_clone.try_recv().is_ok() {
+                            break;
+                        }
+                        match stdout.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                if let Some(mux) = Mux::try_get() {
+                                    if let Some(pane) = mux.get_pane(pane_id) {
+                                        let mut writer = pane.writer();
+                                        if writer.write_all(&buf[..n]).is_err() {
+                                            break;
+                                        }
+                                    } else {
+                                        break;
+                                    }
+                                } else {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                })
+                .ok();
+        }
+    }
+
+    // Store the handle
+    let handle = PipePaneHandle { child, shutdown_tx };
+    PIPE_PANE_STATE.lock().insert(pane_id, handle);
+
+    Ok(String::new())
+}
+
+/// Handle `kill-server`.
+///
+/// Kills all sessions (workspaces) by removing their windows and panes,
+/// then requests detach with a "server killed" reason.
+fn handle_kill_server(ctx: &mut HandlerContext) -> Result<String, String> {
+    let mux = Mux::try_get().ok_or_else(|| "mux not available".to_string())?;
+
+    let workspaces = mux.iter_workspaces();
+    for workspace in &workspaces {
+        let window_ids = mux.iter_windows_in_workspace(workspace);
+        for &wid in &window_ids {
+            let tabs: Vec<Arc<Tab>> = match mux.get_window(wid) {
+                Some(win) => win.iter().map(Arc::clone).collect(),
+                None => continue,
+            };
+            for tab in &tabs {
+                for pp in tab.iter_panes() {
+                    close_pipe_pane(pp.pane.pane_id());
+                    ctx.id_map.remove_pane(pp.pane.pane_id());
+                }
+                ctx.id_map.remove_window(tab.tab_id());
+            }
+        }
+        for wid in window_ids {
+            mux.kill_window(wid);
+        }
+        ctx.id_map.remove_session(workspace);
+    }
+
+    ctx.detach_requested = true;
+    ctx.detach_reason = Some("server killed".to_string());
     Ok(String::new())
 }
 
@@ -3488,13 +3688,14 @@ mod tests {
     fn list_commands_contains_all() {
         let output = handle_list_commands();
         let commands: Vec<&str> = output.lines().collect();
-        assert_eq!(commands.len(), 45);
+        assert_eq!(commands.len(), 46);
         assert!(commands.contains(&"attach-session"));
         assert!(commands.contains(&"break-pane"));
         assert!(commands.contains(&"capture-pane"));
         assert!(commands.contains(&"copy-mode"));
         assert!(commands.contains(&"delete-buffer"));
         assert!(commands.contains(&"detach-client"));
+        assert!(commands.contains(&"display-menu"));
         assert!(commands.contains(&"display-message"));
         assert!(commands.contains(&"has-session"));
         assert!(commands.contains(&"join-pane"));
@@ -4067,7 +4268,7 @@ mod tests {
     fn phase19_list_commands_count() {
         let output = handle_list_commands();
         let commands: Vec<&str> = output.lines().collect();
-        assert_eq!(commands.len(), 45);
+        assert_eq!(commands.len(), 46);
     }
 
     #[test]

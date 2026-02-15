@@ -8,34 +8,34 @@ These are candidates for real implementation later.
 ### copy-mode
 
 **Handler**: `handle_copy_mode()` in `handlers.rs`
-**What it does now**: Returns empty success.
+**What it does now**: Returns empty success. All valid tmux flags (`-d`, `-e`, `-H`, `-M`, `-q`, `-S`, `-s`, `-t`, `-u`) are now accepted by the parser.
 **What it should do**: `-q` could dismiss WezTerm's copy overlay if active. Entering copy mode could trigger WezTerm's copy overlay.
 **Used by**: iTerm2 CC mode (sends `copy-mode -q` on connect as defensive cleanup)
 
-### pipe-pane
-
-**Handler**: Inline stub in `handlers.rs`
-**What it does now**: Returns empty success.
-**What it should do**: Pipe pane output to a shell command (or toggle off if no command given). Our CC `%output` notifications partially cover this use case.
-**Used by**: Logging/monitoring scripts
-
 ### display-popup / display-menu
 
-**Handler**: Inline stub in `handlers.rs`
-**What it does now**: Returns empty success.
+**Handler**: Inline no-op in `handlers.rs`
+**What it does now**: Returns empty success. Parser accepts all valid tmux flags for both `display-popup` and `display-menu` (including boolean flags `-B`, `-C`, `-k`, `-M`, `-N`, `-O` and value flags `-b`, `-c`, `-d`, `-e`, `-h`, `-H`, `-s`, `-S`, `-T`, `-w`, `-x`, `-y`). `display-menu` appears in `list-commands`.
 **What it should do**: Show a popup/overlay inside the terminal. Would require WezTerm GUI overlay support. CC protocol has no popup mechanism; iTerm2 also forbids these.
 **Used by**: tmux popup scripts, fzf-tmux
-
-### kill-server
-
-**Handler**: Inline in `handlers.rs`
-**What it does now**: Sets `ctx.detach_requested = true`, which disconnects the CC client. Does NOT actually kill the WezTerm process.
-**Why it stays**: Arguably correct behavior — killing the WezTerm GUI from a tmux command would be unexpected. Detach-only is the right semantics.
-**Used by**: Cleanup scripts
 
 ---
 
 ## Implemented (no longer no-ops)
+
+### pipe-pane ✓
+
+Full implementation via `handle_pipe_pane()` in `handlers.rs`. Spawns a shell
+command and connects pane I/O: `-O` (default) taps pane output to child stdin
+via `register_output_tap()`, `-I` pipes child stdout to `pane.writer()`.
+Supports `-o` (toggle — no-op if pipe already exists). No command closes
+existing pipe. Pipes are automatically cleaned up on pane removal.
+
+### kill-server ✓
+
+Kills all sessions (workspaces) by removing all windows, tabs, and panes,
+cleaning up pipe-pane handles and ID mappings, then detaches the CC client
+with `%exit server killed`. Does NOT kill the WezTerm GUI process.
 
 ### select-layout ✓
 
