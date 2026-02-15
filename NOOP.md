@@ -3,135 +3,84 @@
 Commands that are parsed and accepted (return success) but don't actually do anything yet.
 These are candidates for real implementation later.
 
-## set-option
+## Remaining No-Ops
 
-**Handler**: `handle_set_option()` in `handlers.rs:2445`
-**What it does now**: Logs the option name/value pair and returns empty success.
-**What it should do**: Apply relevant options to WezTerm. Useful subset:
+### copy-mode
 
-- `-p -t <pane> pane-border-style "fg=<color>"` — Could map to WezTerm pane border colors
-- `-p -t <pane> pane-active-border-style "fg=<color>"` — Active pane border color
-- `-p -t <pane> pane-border-format "<format>"` — Pane border label (could map to tab title format)
-- `-w -t <window> pane-border-status top` — Enable pane labels (could toggle WezTerm tab bar)
-- Global options like `mouse`, `status`, `escape-time` could map to WezTerm config equivalents
-
-**Used by**: Claude Code team mode (pane styling), iTerm2 CC mode
-
-## select-layout
-
-**Handler**: Inline `Ok(String::new())` in `handlers.rs:693`
-**What it does now**: Silently ignored.
-**What it should do**: Rearrange pane layout within a tab. Common layouts:
-
-- `main-vertical` — One large pane on left, rest stacked on right (Claude Code team default)
-- `tiled` — All panes equal size (Claude Code external swarm mode)
-- `even-horizontal` / `even-vertical` — Equal horizontal/vertical splits
-
-**Used by**: Claude Code team mode (rebalancing after pane create/destroy)
-
-## copy-mode
-
-**Handler**: `handle_copy_mode()` in `handlers.rs:841`
+**Handler**: `handle_copy_mode()` in `handlers.rs`
 **What it does now**: Returns empty success.
 **What it should do**: `-q` could dismiss WezTerm's copy overlay if active. Entering copy mode could trigger WezTerm's copy overlay.
 **Used by**: iTerm2 CC mode (sends `copy-mode -q` on connect as defensive cleanup)
 
-## break-pane
+### pipe-pane
 
-**Handler**: `handle_break_pane()` in `handlers.rs:2455`
-**What it does now**: Resolves source pane and target session, then returns empty success. Has scaffolding code for the real implementation.
-**What it should do**: Move a pane out of its current split into a new tab (optionally in a different workspace/session). With `-d`, keep focus on the original window.
-**Used by**: Claude Code team mode (hide pane by breaking to `claude-hidden` session)
-
-## join-pane
-
-**Handler**: Part of `handle_move_pane()` — join-pane is an alias for move-pane.
-**Note**: move-pane IS implemented (moves pane between splits), so join-pane may already work. Verify that the `-h -s <pane> -t <window>` form used by Claude Code team mode (show hidden pane) works correctly.
-**Used by**: Claude Code team mode (show hidden pane by joining back)
-
-## select-pane -P (style)
-
-**Handler**: `handle_select_pane()` in `handlers.rs:1290`
-**What it does now**: The `-P "bg=default,fg=<color>"` style argument is parsed but ignored. Only `-T` (title) and focus are actually applied.
-**What it should do**: Could set pane-specific foreground/background colors if WezTerm supports per-pane color overrides.
-**Used by**: Claude Code team mode (set pane background/foreground color per agent)
-
-## wait-for
-
-**Handler**: Inline stub in `handlers.rs:707`
-**What it does now**: Returns immediately (both `-S` signal and lock/unlock).
-**What it should do**: Implement a channel-based wait/signal mechanism. `wait-for <channel>` blocks until another client sends `wait-for -S <channel>`. Could use async channels.
-**Used by**: Advanced tmux scripting, synchronization between scripts
-
-## pipe-pane
-
-**Handler**: Inline stub in `handlers.rs:714`
+**Handler**: Inline stub in `handlers.rs`
 **What it does now**: Returns empty success.
 **What it should do**: Pipe pane output to a shell command (or toggle off if no command given). Our CC `%output` notifications partially cover this use case.
 **Used by**: Logging/monitoring scripts
 
-## display-popup / display-menu
+### display-popup / display-menu
 
-**Handler**: Inline stub in `handlers.rs:718`
+**Handler**: Inline stub in `handlers.rs`
 **What it does now**: Returns empty success.
-**What it should do**: Show a popup/overlay inside the terminal. Would require WezTerm GUI overlay support.
+**What it should do**: Show a popup/overlay inside the terminal. Would require WezTerm GUI overlay support. CC protocol has no popup mechanism; iTerm2 also forbids these.
 **Used by**: tmux popup scripts, fzf-tmux
 
-## run-shell (partial)
+### kill-server
 
-**Handler**: `handle_run_shell()` in `handlers.rs:847`
-**What it does now**: Executes the command and returns stdout, but ignores `-b` (background), `-t` (target pane for output display), and `-d` (delay).
-**What it should do**: Support background execution (`-b` flag spawns command without blocking). Support `-d` delay. Route output to target pane if `-t` specified.
-**Used by**: tmux scripting, plugin systems
-
-## kill-server
-
-**Handler**: Inline in `handlers.rs:703`
+**Handler**: Inline in `handlers.rs`
 **What it does now**: Sets `ctx.detach_requested = true`, which disconnects the CC client. Does NOT actually kill the WezTerm process.
-**What it should do**: Arguably correct behavior — killing the WezTerm GUI from a tmux command would be unexpected. Could optionally close all tmux-managed panes.
+**Why it stays**: Arguably correct behavior — killing the WezTerm GUI from a tmux command would be unexpected. Detach-only is the right semantics.
 **Used by**: Cleanup scripts
 
 ---
 
-## Priority for Claude Code Team Mode
+## Implemented (no longer no-ops)
 
-**High** (affects visible behavior):
-1. `select-layout` — Layout rebalancing after pane creation
-2. `break-pane` — Hide/show pane workflow
+### select-layout ✓
 
-**Medium** (cosmetic):
-3. `set-option` (pane border styles) — Agent color coding
-4. `select-pane -P` — Per-pane colors
+Rearranges panes in a tab according to named layout presets. Implemented via
+`Tab::apply_layout()` in `tab.rs` with support for: `even-horizontal`,
+`even-vertical`, `main-vertical`, `main-horizontal`, `tiled`.
 
-**Low** (not needed for team mode):
-5. `copy-mode`, `wait-for`, `pipe-pane`, `display-popup`, `run-shell -b`, `kill-server`
+### break-pane ✓
 
----
+Moves a pane out of its current split into a new tab (optionally in a different
+workspace/session). Calls `mux.move_pane_to_new_tab()` and registers the new
+tab/session in the ID map.
 
-## Windows-Specific: `env` command in send-keys
+### select-pane -P (style) ✓
 
-**Not a no-op, but a compatibility gap.**
+Parses tmux `-P "bg=X,fg=Y"` style strings and applies fg/bg colors via OSC
+`ChangeDynamicColors`/`ResetDynamicColor` sequences through `pane.perform_actions()`.
+Supports named colors, `#rrggbb`, `colour0`–`colour255`, and `default` (reset).
 
-Claude Code's team mode sends startup commands to panes via `send-keys` like:
-```
-send-keys -t %5 "cd /path && env CLAUDECODE=1 CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1 'claude.exe' --agent-id ..." Enter
-```
+### set-option (partial) ✓
 
-The `env` utility is Unix-only and doesn't exist in PowerShell. While we now pass
-`-e` env vars directly to the spawned shell process via `CommandBuilder`, the `env`
-inside the `send-keys` payload is a separate issue — it's literal text typed into the
-pane's shell.
+Handles `pane-border-format` (sets pane header text via `pane.set_header()`) and
+`pane-border-status` (enables/disables header display). All other options remain
+soft no-ops with debug logging.
 
-**Possible solutions:**
-1. **Intercept in send-keys handler** — Detect `env KEY=VAL ... command` patterns and
-   rewrite to PowerShell syntax (`$env:KEY='VAL'; command`) when the default shell is
-   PowerShell. Fragile but targeted.
-2. **Ship an `env.exe` shim** — Like the tmux shim, bundle a small `env.exe` that
-   parses `env KEY=VAL command args...` and executes with the environment set. Put it
-   in the tmux-compat PATH.
-3. **Upstream fix in Claude Code** — Report as a Windows bug. Claude Code should detect
-   the shell type and use appropriate syntax.
-4. **Configure WezTerm to use Git Bash** — `config.default_prog = { 'bash.exe', '-l' }`
-   would make `env` available, but changes the user's preferred shell.
+### run-shell (complete) ✓
 
-**Recommended**: Option 2 (ship `env.exe` shim) is the most robust and non-invasive.
+Now supports all flags: `-b` (background execution via `promise::spawn`),
+`-d <secs>` (delay via `smol::Timer`), `-t <pane>` (route output to target pane
+via `pane.writer()`). Foreground mode blocks until completion; background mode
+returns immediately.
+
+### wait-for ✓
+
+Channel-based wait/signal synchronization. `wait-for <channel>` blocks until
+another client sends `wait-for -S <channel>`. Uses a global `WAIT_CHANNELS` store
+with `async-channel` senders/receivers. `-L`/`-U` (lock/unlock) return immediately.
+
+### join-pane ✓
+
+Already working — `join-pane` is an alias for `move-pane`, which is fully
+implemented.
+
+### env.exe shim ✓
+
+New `env-shim` crate producing `env.exe` for Windows. Emulates Unix `env` command
+(`KEY=VAL command args...`, `-i`, `-u VAR`). Deployed to the tmux-compat PATH
+directory alongside `tmux.exe`.
