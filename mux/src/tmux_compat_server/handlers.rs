@@ -149,6 +149,10 @@ pub struct HandlerContext {
     /// the shell closes after the command finishes. One-shot: the pane is
     /// removed from the set after the first `send-keys`.
     pub auto_exit_panes: HashSet<u64>,
+    /// Per-pane `pane-border-format` templates, keyed by WezTerm pane ID.
+    /// Stored so the header can be re-expanded when pane metadata changes
+    /// (e.g. after `select-pane -T` updates the pane title).
+    pub pane_border_formats: HashMap<PaneId, String>,
 }
 
 impl HandlerContext {
@@ -173,6 +177,7 @@ impl HandlerContext {
             pane_output_timestamps: HashMap::new(),
             subscriptions: Vec::new(),
             auto_exit_panes: HashSet::new(),
+            pane_border_formats: HashMap::new(),
         }
     }
 
@@ -1750,13 +1755,24 @@ pub fn handle_select_pane(
         .pane_id
         .ok_or_else(|| "can't find pane".to_string())?;
 
-    // If -T was specified, set pane title (best effort — WezTerm doesn't have per-pane titles,
-    // so we set the containing tab's title instead)
+    // If -T was specified, set the pane title via OSC 2 (SetWindowTitle) so
+    // that `pane.get_title()` and `#{pane_title}` reflect it, then re-expand
+    // any stored pane-border-format template.
     if let Some(new_title) = title {
+        if let Some(pane) = mux.get_pane(pane_id) {
+            use termwiz::escape::osc::OperatingSystemCommand;
+            use termwiz::escape::Action;
+            pane.perform_actions(vec![Action::OperatingSystemCommand(Box::new(
+                OperatingSystemCommand::SetWindowTitle(new_title.to_string()),
+            ))]);
+        }
+        // Also set the tab title for #{window_name} compatibility
         let workspace = ctx.workspace.clone();
         if let Some((tab, _wid)) = find_tab_and_window_for_pane(&mux, pane_id, &workspace) {
             tab.set_title(new_title);
         }
+        // Re-expand any stored pane-border-format template
+        refresh_pane_header(ctx, pane_id);
     }
 
     // If -P style was specified, apply fg/bg colors via OSC sequences
@@ -2687,6 +2703,17 @@ pub fn handle_rename_window(
 
     tab.set_title(name);
 
+    // Re-expand pane-border-format templates for all panes in this window
+    // since #{window_name} may have changed.
+    let pane_ids: Vec<PaneId> = tab
+        .iter_panes_ignoring_zoom()
+        .iter()
+        .map(|pp| pp.pane.pane_id())
+        .collect();
+    for pid in pane_ids {
+        refresh_pane_header(ctx, pid);
+    }
+
     Ok(String::new())
 }
 
@@ -2992,6 +3019,33 @@ fn format_new_pane(
     Ok(format!("%{}", tmux_pane_id))
 }
 
+/// Expand a stored `pane-border-format` template for the given pane and update
+/// the pane's header to the expanded result.  Does nothing if no template is
+/// stored for this pane.
+fn refresh_pane_header(ctx: &mut HandlerContext, wez_pane_id: PaneId) {
+    let template = match ctx.pane_border_formats.get(&wez_pane_id) {
+        Some(t) => t.clone(),
+        None => return,
+    };
+    let mux = match Mux::try_get() {
+        Some(m) => m,
+        None => return,
+    };
+    let workspace = ctx.workspace.clone();
+    if let Some((tab, window_id)) = find_tab_and_window_for_pane(&mux, wez_pane_id, &workspace) {
+        let panes = tab.iter_panes();
+        if let Some(pp) = panes.iter().find(|p| p.pane.pane_id() == wez_pane_id) {
+            let window_index = {
+                let wids = mux.iter_windows_in_workspace(&workspace);
+                wids.iter().position(|&w| w == window_id).unwrap_or(0)
+            };
+            let fctx = build_format_context(ctx, pp, &tab, window_id, window_index, &workspace);
+            let expanded = expand_format(&template, &fctx);
+            pp.pane.set_header(Some(expanded));
+        }
+    }
+}
+
 /// Handle `set-option` — apply supported options, log and ignore the rest.
 fn handle_set_option(
     ctx: &mut HandlerContext,
@@ -3004,17 +3058,19 @@ fn handle_set_option(
 
     match name {
         "pane-border-format" => {
-            // Set the pane header text
-            let mux = Mux::try_get().ok_or_else(|| "mux not available".to_string())?;
+            // Store the format template and expand it (like tmux does on render).
             let resolved = ctx.resolve_target(target)?;
             if let Some(pane_id) = resolved.pane_id {
-                if let Some(pane) = mux.get_pane(pane_id) {
-                    let header = if val.is_empty() {
-                        None
-                    } else {
-                        Some(val.to_string())
-                    };
-                    pane.set_header(header);
+                if val.is_empty() {
+                    ctx.pane_border_formats.remove(&pane_id);
+                    if let Some(mux) = Mux::try_get() {
+                        if let Some(pane) = mux.get_pane(pane_id) {
+                            pane.set_header(None);
+                        }
+                    }
+                } else {
+                    ctx.pane_border_formats.insert(pane_id, val.to_string());
+                    refresh_pane_header(ctx, pane_id);
                 }
             }
         }
