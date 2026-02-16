@@ -1,14 +1,29 @@
+param(
+    [switch]$Debug
+)
+
 $ErrorActionPreference = "Stop"
 
 $env:PATH = "C:\Strawberry\perl\bin;C:\Strawberry\c\bin;$env:PATH"
 
 $InstallDir = "C:\Program Files\WezTerm"
 $ShimDir = "$InstallDir\tmux-compat"
-$TargetDir = "U:\Git\wezterm\target\release"
 
-Write-Host "=== Building wezterm (release) ===" -ForegroundColor Cyan
+if ($Debug) {
+    $BuildProfile = "dev"
+    $ProfileLabel = "debug"
+    $TargetDir = "U:\Git\wezterm\target\debug"
+    $CargoFlags = @()
+} else {
+    $BuildProfile = "release"
+    $ProfileLabel = "release"
+    $TargetDir = "U:\Git\wezterm\target\release"
+    $CargoFlags = @("--release")
+}
+
+Write-Host "=== Building wezterm ($ProfileLabel) ===" -ForegroundColor Cyan
 Set-Location U:\Git\wezterm
-cargo build --release -p wezterm-gui -p wezterm -p wezterm-mux-server -p tmux-compat-shim -p env-shim
+& cargo build @CargoFlags -p wezterm-gui -p wezterm -p wezterm-mux-server -p tmux-compat-shim -p env-shim
 if ($LASTEXITCODE -ne 0) { throw "Build failed" }
 
 Write-Host ""
@@ -54,4 +69,4 @@ try {
 }
 
 Write-Host ""
-Write-Host "=== Done ===" -ForegroundColor Cyan
+Write-Host "=== Done ($ProfileLabel) ===" -ForegroundColor Cyan

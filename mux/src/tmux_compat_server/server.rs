@@ -581,6 +581,7 @@ fn process_cc_connection_sync(
         let (resp_tx, resp_rx) = std::sync::mpsc::sync_channel(1);
         promise::spawn::spawn_into_main_thread(async move {
             promise::spawn::spawn(async move {
+                log::info!("tmux CC cmd: {:?}", cmd_line);
                 let resp = match parse_command(&cmd_line) {
                     Ok(cmd) => match dispatch_command(&mut ctx, cmd).await {
                         Ok(body) => Ok(body),
