@@ -20,7 +20,7 @@ use crate::window::WindowId;
 use crate::Mux;
 
 use super::command_parser::TmuxCliCommand;
-use super::format::{expand_format, FormatContext};
+use super::format::{expand_format, tmux_style_to_ansi, FormatContext};
 use super::id_map::IdMap;
 use super::paste_buffer::{buffer_sample, PasteBufferStore};
 use super::response::session_changed_notification;
@@ -153,6 +153,10 @@ pub struct HandlerContext {
     /// Stored so the header can be re-expanded when pane metadata changes
     /// (e.g. after `select-pane -T` updates the pane title).
     pub pane_border_formats: HashMap<PaneId, String>,
+    /// Persistent pane titles set via `select-pane -T`, keyed by WezTerm pane ID.
+    /// These are preferred over the terminal's own title (which the shell can
+    /// override via OSC 2) when expanding `#{pane_title}`.
+    pub pane_titles: HashMap<PaneId, String>,
 }
 
 impl HandlerContext {
@@ -178,6 +182,7 @@ impl HandlerContext {
             subscriptions: Vec::new(),
             auto_exit_panes: HashSet::new(),
             pane_border_formats: HashMap::new(),
+            pane_titles: HashMap::new(),
         }
     }
 
@@ -491,8 +496,13 @@ pub fn build_format_context(
     let cursor = pp.pane.get_cursor_position();
     let tab_size = tab.get_size();
 
-    // Phase 10: pane metadata
-    let pane_title = pp.pane.get_title();
+    // Phase 10: pane metadata — prefer stored title (set via select-pane -T)
+    // over the terminal's own title (which the shell can override via OSC 2).
+    let pane_title = ctx
+        .pane_titles
+        .get(&pp.pane.pane_id())
+        .cloned()
+        .unwrap_or_else(|| pp.pane.get_title());
     let pane_current_command = pp
         .pane
         .get_foreground_process_name(CachePolicy::AllowStale)
@@ -1755,17 +1765,16 @@ pub fn handle_select_pane(
         .pane_id
         .ok_or_else(|| "can't find pane".to_string())?;
 
-    // If -T was specified, set the pane title via OSC 2 (SetWindowTitle) so
-    // that `pane.get_title()` and `#{pane_title}` reflect it, then re-expand
-    // any stored pane-border-format template.
+    // If -T was specified, store the title persistently (so the shell can't
+    // override it via OSC 2) and re-expand any stored pane-border-format.
     if let Some(new_title) = title {
-        if let Some(pane) = mux.get_pane(pane_id) {
-            use termwiz::escape::osc::OperatingSystemCommand;
-            use termwiz::escape::Action;
-            pane.perform_actions(vec![Action::OperatingSystemCommand(Box::new(
-                OperatingSystemCommand::SetWindowTitle(new_title.to_string()),
-            ))]);
-        }
+        log::info!(
+            "select-pane -T: setting pane {} title to {:?}",
+            pane_id,
+            new_title
+        );
+        // Store in our persistent map — this is what #{pane_title} will use.
+        ctx.pane_titles.insert(pane_id, new_title.to_string());
         // Also set the tab title for #{window_name} compatibility
         let workspace = ctx.workspace.clone();
         if let Some((tab, _wid)) = find_tab_and_window_for_pane(&mux, pane_id, &workspace) {
@@ -3025,7 +3034,13 @@ fn format_new_pane(
 fn refresh_pane_header(ctx: &mut HandlerContext, wez_pane_id: PaneId) {
     let template = match ctx.pane_border_formats.get(&wez_pane_id) {
         Some(t) => t.clone(),
-        None => return,
+        None => {
+            log::info!(
+                "refresh_pane_header: no template stored for pane {}",
+                wez_pane_id
+            );
+            return;
+        }
     };
     let mux = match Mux::try_get() {
         Some(m) => m,
@@ -3041,7 +3056,16 @@ fn refresh_pane_header(ctx: &mut HandlerContext, wez_pane_id: PaneId) {
             };
             let fctx = build_format_context(ctx, pp, &tab, window_id, window_index, &workspace);
             let expanded = expand_format(&template, &fctx);
-            pp.pane.set_header(Some(expanded));
+            let styled = tmux_style_to_ansi(&expanded);
+            log::info!(
+                "refresh_pane_header: pane {} template={:?} pane_title={:?} expanded={:?} styled={:?}",
+                wez_pane_id,
+                template,
+                fctx.pane_title,
+                expanded,
+                styled
+            );
+            pp.pane.set_header(Some(styled));
         }
     }
 }
@@ -3059,6 +3083,11 @@ fn handle_set_option(
     match name {
         "pane-border-format" => {
             // Store the format template and expand it (like tmux does on render).
+            log::info!(
+                "set-option pane-border-format: target={:?} value={:?}",
+                target,
+                val
+            );
             let resolved = ctx.resolve_target(target)?;
             if let Some(pane_id) = resolved.pane_id {
                 if val.is_empty() {

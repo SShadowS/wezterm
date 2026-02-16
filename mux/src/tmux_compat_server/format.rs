@@ -347,6 +347,201 @@ fn resolve_variable(name: &str, ctx: &FormatContext, output: &mut String) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tmux style directive → ANSI CSI conversion
+// ---------------------------------------------------------------------------
+
+/// Convert a tmux color name to its ANSI 256-color index.
+///
+/// Supports the 16 standard color names (`black`..`white`,
+/// `brightblack`..`brightwhite`) plus tmux's `colour0`–`colour255` /
+/// `color0`–`color255` syntax.  Returns `None` for unrecognised names.
+fn tmux_color_name_to_index(name: &str) -> Option<u8> {
+    // Standard 8 + bright 8
+    match name {
+        "black" => Some(0),
+        "red" => Some(1),
+        "green" => Some(2),
+        "yellow" => Some(3),
+        "blue" => Some(4),
+        "magenta" => Some(5),
+        "cyan" => Some(6),
+        "white" => Some(7),
+        "brightblack" => Some(8),
+        "brightred" => Some(9),
+        "brightgreen" => Some(10),
+        "brightyellow" => Some(11),
+        "brightblue" => Some(12),
+        "brightmagenta" => Some(13),
+        "brightcyan" => Some(14),
+        "brightwhite" => Some(15),
+        _ => {
+            // colour0–colour255 / color0–color255
+            if let Some(idx_str) = name.strip_prefix("colour") {
+                idx_str.parse::<u8>().ok()
+            } else if let Some(idx_str) = name.strip_prefix("color") {
+                idx_str.parse::<u8>().ok()
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Emit ANSI SGR codes for a single tmux color specifier into `out`.
+///
+/// `base` is `38` for foreground, `48` for background.
+/// Handles `default`, named colors, `colour<N>`, and `#RRGGBB` hex.
+fn emit_color_sgr(color: &str, base: u8, out: &mut String) {
+    let color = color.trim();
+    if color == "default" {
+        // fg=default → \x1b[39m, bg=default → \x1b[49m
+        let _ = write!(out, "\x1b[{}m", base + 1);
+        return;
+    }
+    // #RRGGBB → true-color SGR
+    if let Some(hex) = color.strip_prefix('#') {
+        if hex.len() == 6 {
+            if let (Ok(r), Ok(g), Ok(b)) = (
+                u8::from_str_radix(&hex[0..2], 16),
+                u8::from_str_radix(&hex[2..4], 16),
+                u8::from_str_radix(&hex[4..6], 16),
+            ) {
+                let _ = write!(out, "\x1b[{};2;{};{};{}m", base, r, g, b);
+                return;
+            }
+        }
+    }
+    // Named / indexed
+    if let Some(idx) = tmux_color_name_to_index(color) {
+        let _ = write!(out, "\x1b[{};5;{}m", base, idx);
+        return;
+    }
+    // Unknown — silently ignore
+}
+
+/// Convert tmux `#[...]` style directives in `text` to ANSI CSI sequences.
+///
+/// Everything outside `#[...]` is passed through unchanged.
+/// Inside the brackets, comma-separated attributes are parsed:
+///
+/// - `default` / `none` → SGR reset (`\x1b[0m`)
+/// - `bold`, `dim`, `italic`, `underscore`, `reverse`, `strikethrough`
+/// - `fg=<color>`, `bg=<color>` where color is a name, `colour<N>`, or `#RRGGBB`
+///
+/// Multiple attributes in one directive (e.g. `#[fg=blue,bold]`) are combined
+/// into a single SGR sequence where possible.
+pub fn tmux_style_to_ansi(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+
+    while i < len {
+        // Look for `#[`
+        if i + 1 < len && bytes[i] == b'#' && bytes[i + 1] == b'[' {
+            let start = i + 2;
+            // Find closing `]`
+            if let Some(end) = bytes[start..].iter().position(|&b| b == b']') {
+                let directive = &text[start..start + end];
+                convert_directive(directive, &mut output);
+                i = start + end + 1;
+            } else {
+                // No closing `]` — emit literally
+                output.push_str("#[");
+                i += 2;
+            }
+        } else {
+            output.push(text[i..].chars().next().unwrap());
+            i += text[i..].chars().next().unwrap().len_utf8();
+        }
+    }
+
+    output
+}
+
+/// Convert a single tmux style directive body (contents between `#[` and `]`)
+/// into ANSI SGR escape sequences appended to `out`.
+fn convert_directive(directive: &str, out: &mut String) {
+    let directive = directive.trim();
+
+    // `#[default]` or `#[none]` → full reset
+    if directive == "default" || directive == "none" {
+        out.push_str("\x1b[0m");
+        return;
+    }
+
+    // Collect SGR parameters from comma-separated parts.
+    // We try to combine simple numeric SGR codes into one sequence,
+    // but colors need their own sequences (they use multi-param forms).
+    let mut sgr_codes: Vec<u8> = Vec::new();
+
+    for part in directive.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+
+        if let Some(color) = part.strip_prefix("fg=") {
+            // Flush accumulated simple codes first
+            if !sgr_codes.is_empty() {
+                flush_sgr(&sgr_codes, out);
+                sgr_codes.clear();
+            }
+            emit_color_sgr(color, 38, out);
+        } else if let Some(color) = part.strip_prefix("bg=") {
+            if !sgr_codes.is_empty() {
+                flush_sgr(&sgr_codes, out);
+                sgr_codes.clear();
+            }
+            emit_color_sgr(color, 48, out);
+        } else if let Some(code) = attr_to_sgr(part) {
+            sgr_codes.push(code);
+        }
+        // Unknown attributes silently ignored
+    }
+
+    if !sgr_codes.is_empty() {
+        flush_sgr(&sgr_codes, out);
+    }
+}
+
+/// Map a tmux attribute name to its SGR code.
+fn attr_to_sgr(attr: &str) -> Option<u8> {
+    match attr {
+        "bold" | "bright" => Some(1),
+        "dim" => Some(2),
+        "italic" | "italics" => Some(3),
+        "underscore" | "underline" => Some(4),
+        "blink" => Some(5),
+        "reverse" => Some(7),
+        "hidden" => Some(8),
+        "strikethrough" => Some(9),
+        "default" | "none" => Some(0),
+        "nobold" => Some(22),
+        "nodim" => Some(22),
+        "noitalics" => Some(23),
+        "nounderscore" => Some(24),
+        "noblink" => Some(25),
+        "noreverse" => Some(27),
+        "nohidden" => Some(28),
+        "nostrikethrough" => Some(29),
+        _ => None,
+    }
+}
+
+/// Flush a list of simple SGR codes as a single `\x1b[...m` sequence.
+fn flush_sgr(codes: &[u8], out: &mut String) {
+    out.push_str("\x1b[");
+    for (i, code) in codes.iter().enumerate() {
+        if i > 0 {
+            out.push(';');
+        }
+        let _ = write!(out, "{}", code);
+    }
+    out.push('m');
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -853,6 +1048,109 @@ mod tests {
         let ctx = test_ctx();
         // Lone '#' at end — emit literally
         assert_eq!(expand_format("test#", &ctx), "test#");
+    }
+
+    // --- tmux_style_to_ansi tests ---
+
+    #[test]
+    fn style_default_reset() {
+        assert_eq!(tmux_style_to_ansi("#[default]"), "\x1b[0m");
+        assert_eq!(tmux_style_to_ansi("#[none]"), "\x1b[0m");
+    }
+
+    #[test]
+    fn style_bold() {
+        assert_eq!(tmux_style_to_ansi("#[bold]"), "\x1b[1m");
+    }
+
+    #[test]
+    fn style_fg_named_color() {
+        assert_eq!(tmux_style_to_ansi("#[fg=blue]"), "\x1b[38;5;4m");
+        assert_eq!(tmux_style_to_ansi("#[fg=red]"), "\x1b[38;5;1m");
+    }
+
+    #[test]
+    fn style_bg_named_color() {
+        assert_eq!(tmux_style_to_ansi("#[bg=green]"), "\x1b[48;5;2m");
+    }
+
+    #[test]
+    fn style_fg_default_reset() {
+        assert_eq!(tmux_style_to_ansi("#[fg=default]"), "\x1b[39m");
+        assert_eq!(tmux_style_to_ansi("#[bg=default]"), "\x1b[49m");
+    }
+
+    #[test]
+    fn style_fg_and_bold_combined() {
+        // #[fg=blue,bold] → color SGR then bold SGR
+        let result = tmux_style_to_ansi("#[fg=blue,bold]");
+        assert_eq!(result, "\x1b[38;5;4m\x1b[1m");
+    }
+
+    #[test]
+    fn style_colour_index() {
+        assert_eq!(tmux_style_to_ansi("#[fg=colour196]"), "\x1b[38;5;196m");
+        assert_eq!(tmux_style_to_ansi("#[bg=color42]"), "\x1b[48;5;42m");
+    }
+
+    #[test]
+    fn style_hex_color() {
+        assert_eq!(
+            tmux_style_to_ansi("#[fg=#ff0000]"),
+            "\x1b[38;2;255;0;0m"
+        );
+        assert_eq!(
+            tmux_style_to_ansi("#[bg=#00ff00]"),
+            "\x1b[48;2;0;255;0m"
+        );
+    }
+
+    #[test]
+    fn style_passthrough_text() {
+        assert_eq!(
+            tmux_style_to_ansi("hello world"),
+            "hello world"
+        );
+    }
+
+    #[test]
+    fn style_mixed_text_and_directives() {
+        let input = "#[fg=blue,bold] oslo-agent #[default]";
+        let result = tmux_style_to_ansi(input);
+        assert_eq!(result, "\x1b[38;5;4m\x1b[1m oslo-agent \x1b[0m");
+    }
+
+    #[test]
+    fn style_bright_colors() {
+        assert_eq!(
+            tmux_style_to_ansi("#[fg=brightred]"),
+            "\x1b[38;5;9m"
+        );
+        assert_eq!(
+            tmux_style_to_ansi("#[fg=brightwhite]"),
+            "\x1b[38;5;15m"
+        );
+    }
+
+    #[test]
+    fn style_multiple_simple_attrs() {
+        assert_eq!(
+            tmux_style_to_ansi("#[bold,italic]"),
+            "\x1b[1;3m"
+        );
+    }
+
+    #[test]
+    fn style_unclosed_bracket() {
+        // No closing ] — emit literally
+        assert_eq!(tmux_style_to_ansi("#[bold"), "#[bold");
+    }
+
+    #[test]
+    fn style_underscore_and_reverse() {
+        assert_eq!(tmux_style_to_ansi("#[underscore]"), "\x1b[4m");
+        assert_eq!(tmux_style_to_ansi("#[reverse]"), "\x1b[7m");
+        assert_eq!(tmux_style_to_ansi("#[strikethrough]"), "\x1b[9m");
     }
 
     #[test]
