@@ -321,9 +321,14 @@ pub fn translate_notification(
         }
 
         MuxNotification::PaneRemoved(pane_id) => {
-            // Clean up pipe-pane and id_map, but don't emit a separate notification.
+            // Clean up pipe-pane, spawned-pane tracking, and id_map, but don't
+            // emit a separate notification.
             // The layout-change from TabResized covers the visual change.
+            // Note: currently used from tests; production cleanup is handled
+            // by reap_dead_cc_panes (periodic) and cleanup_cc_spawned_panes
+            // (disconnect).
             super::handlers::close_pipe_pane(pane_id);
+            session.ctx.cc_spawned_panes.remove(&pane_id);
             session.ctx.id_map.remove_pane(pane_id);
             None
         }
@@ -562,6 +567,9 @@ fn process_cc_connection_sync(
             let n = std::io::Read::read(&mut stream, &mut read_buf)?;
             if n == 0 {
                 log::trace!("CC client disconnected (EOF)");
+                super::handlers::cleanup_cc_spawned_panes(
+                    std::mem::take(&mut session.ctx.cc_spawned_panes),
+                );
                 return Ok(());
             }
             accum.push_str(&String::from_utf8_lossy(&read_buf[..n]));
@@ -636,7 +644,7 @@ fn process_cc_connection_sync(
         // Drain output after command response too.
         drain_output_taps(&mut session, &output_rx, &mut stream)?;
 
-        // Check subscriptions periodically (every ~1s).
+        // Check subscriptions and reap dead panes periodically (every ~1s).
         if last_subscription_check.elapsed() >= std::time::Duration::from_secs(1) {
             let sub_notifs = super::handlers::check_subscriptions(&mut session.ctx);
             for notif in sub_notifs {
@@ -645,6 +653,7 @@ fn process_cc_connection_sync(
             if !session.ctx.subscriptions.is_empty() {
                 std::io::Write::flush(&mut stream)?;
             }
+            super::handlers::reap_dead_cc_panes(&mut session.ctx);
             last_subscription_check = std::time::Instant::now();
         }
 
@@ -654,6 +663,9 @@ fn process_cc_connection_sync(
             std::io::Write::write_all(&mut stream, exit.as_bytes())?;
             std::io::Write::flush(&mut stream)?;
             log::info!("tmux CC: client detached");
+            super::handlers::cleanup_cc_spawned_panes(
+                std::mem::take(&mut session.ctx.cc_spawned_panes),
+            );
             return Ok(());
         }
     }

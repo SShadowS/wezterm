@@ -68,6 +68,54 @@ pub fn close_pipe_pane(pane_id: PaneId) {
     }
 }
 
+/// Remove all CC-spawned panes on disconnect.
+///
+/// Called when the CC client disconnects (EOF) or detaches, to clean up
+/// panes that were created by the CC session (e.g. agent team splits).
+pub fn cleanup_cc_spawned_panes(panes: HashSet<PaneId>) {
+    if panes.is_empty() {
+        return;
+    }
+    log::info!(
+        "tmux CC: cleaning up {} spawned pane(s) on disconnect",
+        panes.len()
+    );
+    if let Some(mux) = Mux::try_get() {
+        for pane_id in panes {
+            mux.remove_pane(pane_id);
+        }
+    }
+}
+
+/// Reap dead CC-spawned panes during an active session.
+///
+/// Checks all tracked CC-spawned panes; any that are dead (process exited)
+/// or already removed from the mux are cleaned up.
+pub fn reap_dead_cc_panes(ctx: &mut HandlerContext) {
+    let mux = match Mux::try_get() {
+        Some(m) => m,
+        None => return,
+    };
+    let dead: Vec<PaneId> = ctx
+        .cc_spawned_panes
+        .iter()
+        .copied()
+        .filter(|&pid| match mux.get_pane(pid) {
+            Some(pane) => pane.is_dead(),
+            None => true, // already gone
+        })
+        .collect();
+    for pid in &dead {
+        log::info!("tmux CC: reaping dead spawned pane {}", pid);
+        ctx.cc_spawned_panes.remove(pid);
+        if let Some(tid) = ctx.id_map.tmux_pane_id(*pid) {
+            ctx.auto_exit_panes.remove(&tid);
+        }
+        ctx.id_map.remove_pane(*pid);
+        mux.remove_pane(*pid);
+    }
+}
+
 /// Resolved WezTerm IDs from a tmux target specification.
 #[derive(Debug, Default)]
 pub struct ResolvedTarget {
@@ -157,6 +205,10 @@ pub struct HandlerContext {
     /// These are preferred over the terminal's own title (which the shell can
     /// override via OSC 2) when expanding `#{pane_title}`.
     pub pane_titles: HashMap<PaneId, String>,
+    /// WezTerm pane IDs of panes spawned by this CC session (via split-window,
+    /// new-window, new-session). Used to clean up panes on disconnect and to
+    /// reap dead panes during the session.
+    pub cc_spawned_panes: HashSet<PaneId>,
 }
 
 impl HandlerContext {
@@ -183,6 +235,7 @@ impl HandlerContext {
             auto_exit_panes: HashSet::new(),
             pane_border_formats: HashMap::new(),
             pane_titles: HashMap::new(),
+            cc_spawned_panes: HashSet::new(),
         }
     }
 
@@ -1904,7 +1957,8 @@ pub fn handle_kill_pane(
         .pane_id
         .ok_or_else(|| "can't find pane".to_string())?;
 
-    // Clean up auto-exit tracking before removing the pane mapping
+    // Clean up tracking before removing the pane mapping
+    ctx.cc_spawned_panes.remove(&pane_id);
     if let Some(tid) = ctx.id_map.tmux_pane_id(pane_id) {
         ctx.auto_exit_panes.remove(&tid);
     }
@@ -2546,6 +2600,9 @@ pub async fn handle_split_window(
     let tmux_pane_id = ctx.id_map.get_or_create_tmux_pane_id(new_pane.pane_id());
     ctx.active_pane_id = Some(tmux_pane_id);
 
+    // Track CC-spawned panes for disconnect cleanup and dead-pane reaping
+    ctx.cc_spawned_panes.insert(new_pane.pane_id());
+
     // If -P was specified, mark as auto-exit and return format-expanded info
     if let Some(fmt) = print_and_format {
         ctx.auto_exit_panes.insert(tmux_pane_id);
@@ -2611,6 +2668,9 @@ pub async fn handle_new_window(
     let tmux_pane_id = ctx.id_map.get_or_create_tmux_pane_id(pane.pane_id());
     ctx.active_window_id = Some(tmux_window_id);
     ctx.active_pane_id = Some(tmux_pane_id);
+
+    // Track CC-spawned panes for disconnect cleanup and dead-pane reaping
+    ctx.cc_spawned_panes.insert(pane.pane_id());
 
     // If -P was specified, mark as auto-exit and return format-expanded info
     if let Some(fmt) = print_and_format {
@@ -2945,6 +3005,9 @@ pub async fn handle_new_session(
     ctx.active_window_id = Some(tmux_window_id);
     ctx.active_pane_id = Some(tmux_pane_id);
     ctx.workspace = workspace;
+
+    // Track CC-spawned panes for disconnect cleanup and dead-pane reaping
+    ctx.cc_spawned_panes.insert(pane.pane_id());
 
     // If -P was specified, mark as auto-exit and return format-expanded info
     if let Some(fmt) = print_and_format {

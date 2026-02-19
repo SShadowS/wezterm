@@ -298,6 +298,28 @@ fn take_flag_value<'a>(flag: &str, iter: &mut impl Iterator<Item = &'a str>) -> 
     }
 }
 
+/// Expand combined boolean flags like `-hP` into individual flags `-h`, `-P`.
+///
+/// If an argument starts with `-` and is longer than 2 chars, and all chars
+/// after the `-` are in `bool_flags`, the arg is expanded. Otherwise it is
+/// passed through unchanged.
+fn expand_combined_flags(args: &[String], bool_flags: &str) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len());
+    for arg in args {
+        if arg.starts_with('-')
+            && arg.len() > 2
+            && arg[1..].chars().all(|c| bool_flags.contains(c))
+        {
+            for ch in arg[1..].chars() {
+                out.push(format!("-{ch}"));
+            }
+        } else {
+            out.push(arg.clone());
+        }
+    }
+    out
+}
+
 fn parse_split_window(args: &[String]) -> Result<TmuxCliCommand> {
     let mut horizontal = false;
     let mut vertical = false;
@@ -308,7 +330,8 @@ fn parse_split_window(args: &[String]) -> Result<TmuxCliCommand> {
     let mut cwd = None;
     let mut env = Vec::new();
 
-    let strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let expanded = expand_combined_flags(args, "hvPdbfZI");
+    let strs: Vec<&str> = expanded.iter().map(|s| s.as_str()).collect();
     let mut iter = strs.iter().copied();
     while let Some(arg) = iter.next() {
         match arg {
@@ -490,7 +513,8 @@ fn parse_new_window(args: &[String]) -> Result<TmuxCliCommand> {
     let mut cwd = None;
     let mut env = Vec::new();
 
-    let strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let expanded = expand_combined_flags(args, "PdSabk");
+    let strs: Vec<&str> = expanded.iter().map(|s| s.as_str()).collect();
     let mut iter = strs.iter().copied();
     while let Some(arg) = iter.next() {
         match arg {
@@ -810,7 +834,8 @@ fn parse_new_session(args: &[String]) -> Result<TmuxCliCommand> {
     let mut cwd = None;
     let mut env = Vec::new();
 
-    let strs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let expanded = expand_combined_flags(args, "PdADEX");
+    let strs: Vec<&str> = expanded.iter().map(|s| s.as_str()).collect();
     let mut iter = strs.iter().copied();
     while let Some(arg) = iter.next() {
         match arg {
@@ -3613,5 +3638,78 @@ mod tests {
                 target: None,
             }
         );
+    }
+
+    // ---------------------------------------------------------------
+    // Combined boolean flags
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn split_window_combined_flags_hp() {
+        // Claude Code may send -hP as a combined flag
+        assert_eq!(
+            parse("split-window -hP -F '#{pane_id}'"),
+            TmuxCliCommand::SplitWindow {
+                horizontal: true,
+                vertical: false,
+                target: None,
+                size: None,
+                print_and_format: Some("#{pane_id}".into()),
+                cwd: None,
+                env: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn split_window_combined_flags_hdp() {
+        assert_eq!(
+            parse("split-window -hdP -F '#{pane_id}'"),
+            TmuxCliCommand::SplitWindow {
+                horizontal: true,
+                vertical: false,
+                target: None,
+                size: None,
+                print_and_format: Some("#{pane_id}".into()),
+                cwd: None,
+                env: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn new_window_combined_flags_dp() {
+        assert_eq!(
+            parse("new-window -dP -F '#{pane_id}'"),
+            TmuxCliCommand::NewWindow {
+                target: None,
+                name: None,
+                print_and_format: Some("#{pane_id}".into()),
+                cwd: None,
+                env: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn new_session_combined_flags_dp() {
+        assert_eq!(
+            parse("new-session -dP -s test -F '#{pane_id}'"),
+            TmuxCliCommand::NewSession {
+                name: Some("test".into()),
+                window_name: None,
+                detached: true,
+                print_and_format: Some("#{pane_id}".into()),
+                cwd: None,
+                env: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn combined_flags_not_expanded_when_value_flag_present() {
+        // -tP contains 't' which takes a value, so it should NOT be expanded
+        // and should fail as an unknown arg
+        assert!(parse_command("split-window -tP").is_err());
     }
 }
