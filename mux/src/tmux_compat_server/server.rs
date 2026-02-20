@@ -328,7 +328,7 @@ pub fn translate_notification(
             // by reap_dead_cc_panes (periodic) and cleanup_cc_spawned_panes
             // (disconnect).
             super::handlers::close_pipe_pane(pane_id);
-            session.ctx.cc_spawned_panes.remove(&pane_id);
+            super::handlers::cc_global_remove_spawned(&session.ctx.workspace, pane_id);
             session.ctx.id_map.remove_pane(pane_id);
             None
         }
@@ -567,9 +567,11 @@ fn process_cc_connection_sync(
             let n = std::io::Read::read(&mut stream, &mut read_buf)?;
             if n == 0 {
                 log::trace!("CC client disconnected (EOF)");
-                super::handlers::cleanup_cc_spawned_panes(
-                    std::mem::take(&mut session.ctx.cc_spawned_panes),
-                );
+                // Don't clean up spawned panes on EOF — for one-shot
+                // connections (Claude Code sends each command on a
+                // separate TCP connection), the panes are still in use.
+                // Cleanup happens on explicit detach-client or via the
+                // periodic reap_dead_cc_panes reaper.
                 return Ok(());
             }
             accum.push_str(&String::from_utf8_lossy(&read_buf[..n]));
@@ -663,9 +665,7 @@ fn process_cc_connection_sync(
             std::io::Write::write_all(&mut stream, exit.as_bytes())?;
             std::io::Write::flush(&mut stream)?;
             log::info!("tmux CC: client detached");
-            super::handlers::cleanup_cc_spawned_panes(
-                std::mem::take(&mut session.ctx.cc_spawned_panes),
-            );
+            super::handlers::cleanup_cc_spawned_panes(&session.ctx.workspace);
             return Ok(());
         }
     }

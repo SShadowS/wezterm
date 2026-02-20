@@ -68,11 +68,107 @@ pub fn close_pipe_pane(pane_id: PaneId) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Global CC pane tracking (shared across one-shot connections)
+// ---------------------------------------------------------------------------
+
+/// State for CC-spawned panes that must persist across TCP connections.
+///
+/// Claude Code sends each tmux CC command on a separate TCP connection
+/// (connect → send → disconnect). Per-session tracking is therefore lost
+/// between `split-window -P` (connection A) and the subsequent `send-keys`
+/// (connection B). This global state, keyed by workspace, bridges that gap.
+struct CcGlobalState {
+    /// Tmux pane IDs of panes created with `-P` flag. `send-keys` injects
+    /// `; exit` so the shell closes after the command finishes. One-shot:
+    /// the pane is removed from the set after the first matching `send-keys`.
+    auto_exit_panes: HashSet<u64>,
+    /// WezTerm pane IDs of panes created by CC commands (split-window,
+    /// new-window, new-session). Used for disconnect cleanup and dead-pane
+    /// reaping.
+    cc_spawned_panes: HashSet<PaneId>,
+}
+
+impl Default for CcGlobalState {
+    fn default() -> Self {
+        Self {
+            auto_exit_panes: HashSet::new(),
+            cc_spawned_panes: HashSet::new(),
+        }
+    }
+}
+
+/// Global CC pane tracking, shared across all one-shot connections.
+/// Keyed by workspace name.
+static CC_GLOBAL: LazyLock<ParkMutex<HashMap<String, CcGlobalState>>> =
+    LazyLock::new(Default::default);
+
+/// Mark a tmux pane ID for auto-exit (`; exit` injection on first `send-keys`).
+fn cc_global_insert_auto_exit(workspace: &str, tmux_pane_id: u64) {
+    CC_GLOBAL
+        .lock()
+        .entry(workspace.to_string())
+        .or_default()
+        .auto_exit_panes
+        .insert(tmux_pane_id);
+}
+
+/// Check and consume an auto-exit entry. Returns `true` if the pane was
+/// marked for auto-exit (and removes it). Returns `false` without side
+/// effects if it wasn't.
+fn cc_global_check_auto_exit(workspace: &str, tmux_pane_id: u64) -> bool {
+    CC_GLOBAL
+        .lock()
+        .get_mut(workspace)
+        .map_or(false, |s| s.auto_exit_panes.remove(&tmux_pane_id))
+}
+
+/// Track a WezTerm pane ID as CC-spawned (for cleanup on disconnect).
+fn cc_global_insert_spawned(workspace: &str, pane_id: PaneId) {
+    CC_GLOBAL
+        .lock()
+        .entry(workspace.to_string())
+        .or_default()
+        .cc_spawned_panes
+        .insert(pane_id);
+}
+
+/// Remove a single CC-spawned pane (e.g. on kill-pane).
+pub fn cc_global_remove_spawned(workspace: &str, pane_id: PaneId) {
+    if let Some(s) = CC_GLOBAL.lock().get_mut(workspace) {
+        s.cc_spawned_panes.remove(&pane_id);
+    }
+}
+
+/// Remove an auto-exit entry without the check (e.g. on kill-pane).
+fn cc_global_remove_auto_exit(workspace: &str, tmux_pane_id: u64) {
+    if let Some(s) = CC_GLOBAL.lock().get_mut(workspace) {
+        s.auto_exit_panes.remove(&tmux_pane_id);
+    }
+}
+
+/// Take all CC-spawned pane IDs for a workspace (for bulk cleanup on disconnect).
+fn cc_global_take_spawned(workspace: &str) -> HashSet<PaneId> {
+    CC_GLOBAL
+        .lock()
+        .get_mut(workspace)
+        .map_or_else(HashSet::new, |s| std::mem::take(&mut s.cc_spawned_panes))
+}
+
+/// Get a snapshot of CC-spawned pane IDs for iteration (e.g. reaping).
+fn cc_global_get_spawned(workspace: &str) -> HashSet<PaneId> {
+    CC_GLOBAL
+        .lock()
+        .get(workspace)
+        .map_or_else(HashSet::new, |s| s.cc_spawned_panes.clone())
+}
+
 /// Remove all CC-spawned panes on disconnect.
 ///
 /// Called when the CC client disconnects (EOF) or detaches, to clean up
 /// panes that were created by the CC session (e.g. agent team splits).
-pub fn cleanup_cc_spawned_panes(panes: HashSet<PaneId>) {
+pub fn cleanup_cc_spawned_panes(workspace: &str) {
+    let panes = cc_global_take_spawned(workspace);
     if panes.is_empty() {
         return;
     }
@@ -96,8 +192,8 @@ pub fn reap_dead_cc_panes(ctx: &mut HandlerContext) {
         Some(m) => m,
         None => return,
     };
-    let dead: Vec<PaneId> = ctx
-        .cc_spawned_panes
+    let spawned = cc_global_get_spawned(&ctx.workspace);
+    let dead: Vec<PaneId> = spawned
         .iter()
         .copied()
         .filter(|&pid| match mux.get_pane(pid) {
@@ -107,9 +203,9 @@ pub fn reap_dead_cc_panes(ctx: &mut HandlerContext) {
         .collect();
     for pid in &dead {
         log::info!("tmux CC: reaping dead spawned pane {}", pid);
-        ctx.cc_spawned_panes.remove(pid);
+        cc_global_remove_spawned(&ctx.workspace, *pid);
         if let Some(tid) = ctx.id_map.tmux_pane_id(*pid) {
-            ctx.auto_exit_panes.remove(&tid);
+            cc_global_remove_auto_exit(&ctx.workspace, tid);
         }
         ctx.id_map.remove_pane(*pid);
         mux.remove_pane(*pid);
@@ -192,11 +288,7 @@ pub struct HandlerContext {
     pub pane_output_timestamps: HashMap<u64, std::time::Instant>,
     /// Format subscriptions registered via `refresh-client -B`.
     pub subscriptions: Vec<Subscription>,
-    /// Tmux pane IDs of panes created programmatically (via `-P -F` flags).
-    /// When `send-keys` targets one of these panes, `; exit` is appended so
-    /// the shell closes after the command finishes. One-shot: the pane is
-    /// removed from the set after the first `send-keys`.
-    pub auto_exit_panes: HashSet<u64>,
+
     /// Per-pane `pane-border-format` templates, keyed by WezTerm pane ID.
     /// Stored so the header can be re-expanded when pane metadata changes
     /// (e.g. after `select-pane -T` updates the pane title).
@@ -205,10 +297,7 @@ pub struct HandlerContext {
     /// These are preferred over the terminal's own title (which the shell can
     /// override via OSC 2) when expanding `#{pane_title}`.
     pub pane_titles: HashMap<PaneId, String>,
-    /// WezTerm pane IDs of panes spawned by this CC session (via split-window,
-    /// new-window, new-session). Used to clean up panes on disconnect and to
-    /// reap dead panes during the session.
-    pub cc_spawned_panes: HashSet<PaneId>,
+
 }
 
 impl HandlerContext {
@@ -232,10 +321,8 @@ impl HandlerContext {
             paused_panes: HashMap::new(),
             pane_output_timestamps: HashMap::new(),
             subscriptions: Vec::new(),
-            auto_exit_panes: HashSet::new(),
             pane_border_formats: HashMap::new(),
             pane_titles: HashMap::new(),
-            cc_spawned_panes: HashSet::new(),
         }
     }
 
@@ -551,9 +638,16 @@ pub fn build_format_context(
 
     // Phase 10: pane metadata — prefer stored title (set via select-pane -T)
     // over the terminal's own title (which the shell can override via OSC 2).
-    let pane_title = ctx
-        .pane_titles
-        .get(&pp.pane.pane_id())
+    let wez_pane_id = pp.pane.pane_id();
+    let stored_title = ctx.pane_titles.get(&wez_pane_id);
+    log::info!(
+        "build_format_context: wez_pane_id={} stored_title={:?} pane_titles={:?} terminal_title={:?}",
+        wez_pane_id,
+        stored_title,
+        ctx.pane_titles,
+        pp.pane.get_title()
+    );
+    let pane_title = stored_title
         .cloned()
         .unwrap_or_else(|| pp.pane.get_title());
     let pane_current_command = pp
@@ -707,6 +801,7 @@ pub async fn dispatch_command(
             print_and_format,
             cwd,
             env,
+            shell_command,
         } => {
             handle_split_window(
                 ctx,
@@ -716,6 +811,7 @@ pub async fn dispatch_command(
                 print_and_format.as_deref(),
                 cwd.as_deref(),
                 &env,
+                shell_command.as_deref(),
             )
             .await
         }
@@ -725,6 +821,7 @@ pub async fn dispatch_command(
             print_and_format,
             cwd,
             env,
+            shell_command,
         } => {
             handle_new_window(
                 ctx,
@@ -733,6 +830,7 @@ pub async fn dispatch_command(
                 print_and_format.as_deref(),
                 cwd.as_deref(),
                 &env,
+                shell_command.as_deref(),
             )
             .await
         }
@@ -749,6 +847,7 @@ pub async fn dispatch_command(
             print_and_format,
             cwd,
             env,
+            shell_command,
         } => {
             handle_new_session(
                 ctx,
@@ -757,6 +856,7 @@ pub async fn dispatch_command(
                 print_and_format.as_deref(),
                 cwd.as_deref(),
                 &env,
+                shell_command.as_deref(),
             )
             .await
         }
@@ -1692,11 +1792,15 @@ pub fn handle_send_keys(
 
     // If this pane was created programmatically (via -P -F), append "; exit"
     // before the trailing Enter so the shell closes after the command finishes.
-    if let Some(tid) = ctx.id_map.tmux_pane_id(pane_id) {
-        if ctx.auto_exit_panes.remove(&tid) && all_bytes.ends_with(b"\r") {
-            let enter_pos = all_bytes.len() - 1;
-            let exit_bytes = b"; exit";
-            all_bytes.splice(enter_pos..enter_pos, exit_bytes.iter().copied());
+    // Check ends_with first (cheap, no side effects) before consuming the
+    // one-shot auto_exit entry from global state.
+    if all_bytes.ends_with(b"\r") {
+        if let Some(tid) = ctx.id_map.tmux_pane_id(pane_id) {
+            if cc_global_check_auto_exit(&ctx.workspace, tid) {
+                let enter_pos = all_bytes.len() - 1;
+                let exit_bytes = b"; exit";
+                all_bytes.splice(enter_pos..enter_pos, exit_bytes.iter().copied());
+            }
         }
     }
 
@@ -1958,9 +2062,9 @@ pub fn handle_kill_pane(
         .ok_or_else(|| "can't find pane".to_string())?;
 
     // Clean up tracking before removing the pane mapping
-    ctx.cc_spawned_panes.remove(&pane_id);
+    cc_global_remove_spawned(&ctx.workspace, pane_id);
     if let Some(tid) = ctx.id_map.tmux_pane_id(pane_id) {
-        ctx.auto_exit_panes.remove(&tid);
+        cc_global_remove_auto_exit(&ctx.workspace, tid);
     }
     ctx.id_map.remove_pane(pane_id);
     mux.remove_pane(pane_id);
@@ -2536,6 +2640,41 @@ fn find_window_for_pane(
 // Async handlers
 // ---------------------------------------------------------------------------
 
+/// Build a `CommandBuilder` that runs a shell command non-interactively.
+///
+/// The command is executed via `<shell> <flag> <command>` where the shell and
+/// flag are determined from `default_prog` in the WezTerm config or platform
+/// defaults. The pane will close automatically when the command exits
+/// (ExitBehavior::Close is the default).
+fn build_shell_command(shell_command: &str) -> CommandBuilder {
+    let config = config::configuration();
+    let (prog, flag) = if let Some(ref dp) = config.default_prog {
+        if !dp.is_empty() {
+            let p = &dp[0];
+            let stem = p.rsplit(['/', '\\']).next().unwrap_or(p).to_lowercase();
+            let stem = stem.strip_suffix(".exe").unwrap_or(&stem);
+            let f = match stem {
+                "cmd" => "/c",
+                "powershell" | "pwsh" => "-Command",
+                _ => "-c",
+            };
+            (p.clone(), f.to_string())
+        } else if cfg!(windows) {
+            ("cmd".into(), "/c".into())
+        } else {
+            ("/bin/sh".into(), "-c".into())
+        }
+    } else if cfg!(windows) {
+        ("cmd".into(), "/c".into())
+    } else {
+        ("/bin/sh".into(), "-c".into())
+    };
+    let mut builder = CommandBuilder::new(&prog);
+    builder.arg(&flag);
+    builder.arg(shell_command);
+    builder
+}
+
 /// Split a window pane.
 ///
 /// tmux `-h` = horizontal split (side by side) = WezTerm `SplitDirection::Horizontal`
@@ -2548,6 +2687,7 @@ pub async fn handle_split_window(
     print_and_format: Option<&str>,
     cwd: Option<&str>,
     env: &[String],
+    shell_command: Option<&str>,
 ) -> Result<String, String> {
     let mux = Mux::try_get().ok_or_else(|| "mux not available".to_string())?;
 
@@ -2571,7 +2711,18 @@ pub async fn handle_split_window(
         size: split_size,
     };
 
-    let command = if !env.is_empty() || cwd.is_some() {
+    let command = if let Some(cmd) = shell_command {
+        let mut builder = build_shell_command(cmd);
+        for kv in env {
+            if let Some((k, v)) = kv.split_once('=') {
+                builder.env(k, v);
+            }
+        }
+        if let Some(dir) = cwd {
+            builder.cwd(dir);
+        }
+        Some(builder)
+    } else if !env.is_empty() || cwd.is_some() {
         let mut builder = CommandBuilder::new_default_prog();
         for kv in env {
             if let Some((k, v)) = kv.split_once('=') {
@@ -2601,11 +2752,15 @@ pub async fn handle_split_window(
     ctx.active_pane_id = Some(tmux_pane_id);
 
     // Track CC-spawned panes for disconnect cleanup and dead-pane reaping
-    ctx.cc_spawned_panes.insert(new_pane.pane_id());
+    cc_global_insert_spawned(&ctx.workspace, new_pane.pane_id());
 
-    // If -P was specified, mark as auto-exit and return format-expanded info
+    // If -P was specified, mark as auto-exit and return format-expanded info.
+    // Skip auto-exit when a shell_command was given — the pane will close
+    // automatically when the command finishes (ExitBehavior::Close).
     if let Some(fmt) = print_and_format {
-        ctx.auto_exit_panes.insert(tmux_pane_id);
+        if shell_command.is_none() {
+            cc_global_insert_auto_exit(&ctx.workspace, tmux_pane_id);
+        }
         return format_new_pane(ctx, new_pane.pane_id(), fmt);
     }
 
@@ -2620,6 +2775,7 @@ pub async fn handle_new_window(
     print_and_format: Option<&str>,
     cwd: Option<&str>,
     env: &[String],
+    shell_command: Option<&str>,
 ) -> Result<String, String> {
     let mux = Mux::try_get().ok_or_else(|| "mux not available".to_string())?;
 
@@ -2630,7 +2786,18 @@ pub async fn handle_new_window(
 
     let current_pane_id = resolved.pane_id;
 
-    let command = if !env.is_empty() || cwd.is_some() {
+    let command = if let Some(cmd) = shell_command {
+        let mut builder = build_shell_command(cmd);
+        for kv in env {
+            if let Some((k, v)) = kv.split_once('=') {
+                builder.env(k, v);
+            }
+        }
+        if let Some(dir) = cwd {
+            builder.cwd(dir);
+        }
+        Some(builder)
+    } else if !env.is_empty() || cwd.is_some() {
         let mut builder = CommandBuilder::new_default_prog();
         for kv in env {
             if let Some((k, v)) = kv.split_once('=') {
@@ -2670,11 +2837,15 @@ pub async fn handle_new_window(
     ctx.active_pane_id = Some(tmux_pane_id);
 
     // Track CC-spawned panes for disconnect cleanup and dead-pane reaping
-    ctx.cc_spawned_panes.insert(pane.pane_id());
+    cc_global_insert_spawned(&ctx.workspace, pane.pane_id());
 
-    // If -P was specified, mark as auto-exit and return format-expanded info
+    // If -P was specified, mark as auto-exit and return format-expanded info.
+    // Skip auto-exit when a shell_command was given — the pane will close
+    // automatically when the command finishes (ExitBehavior::Close).
     if let Some(fmt) = print_and_format {
-        ctx.auto_exit_panes.insert(tmux_pane_id);
+        if shell_command.is_none() {
+            cc_global_insert_auto_exit(&ctx.workspace, tmux_pane_id);
+        }
         return format_new_pane(ctx, pane.pane_id(), fmt);
     }
 
@@ -2953,6 +3124,7 @@ pub async fn handle_new_session(
     print_and_format: Option<&str>,
     cwd: Option<&str>,
     env: &[String],
+    shell_command: Option<&str>,
 ) -> Result<String, String> {
     let mux = Mux::try_get().ok_or_else(|| "mux not available".to_string())?;
 
@@ -2963,7 +3135,18 @@ pub async fn handle_new_session(
         return Err(format!("duplicate session: {}", workspace));
     }
 
-    let command = if !env.is_empty() || cwd.is_some() {
+    let command = if let Some(cmd) = shell_command {
+        let mut builder = build_shell_command(cmd);
+        for kv in env {
+            if let Some((k, v)) = kv.split_once('=') {
+                builder.env(k, v);
+            }
+        }
+        if let Some(dir) = cwd {
+            builder.cwd(dir);
+        }
+        Some(builder)
+    } else if !env.is_empty() || cwd.is_some() {
         let mut builder = CommandBuilder::new_default_prog();
         for kv in env {
             if let Some((k, v)) = kv.split_once('=') {
@@ -3007,11 +3190,15 @@ pub async fn handle_new_session(
     ctx.workspace = workspace;
 
     // Track CC-spawned panes for disconnect cleanup and dead-pane reaping
-    ctx.cc_spawned_panes.insert(pane.pane_id());
+    cc_global_insert_spawned(&ctx.workspace, pane.pane_id());
 
-    // If -P was specified, mark as auto-exit and return format-expanded info
+    // If -P was specified, mark as auto-exit and return format-expanded info.
+    // Skip auto-exit when a shell_command was given — the pane will close
+    // automatically when the command finishes (ExitBehavior::Close).
     if let Some(fmt) = print_and_format {
-        ctx.auto_exit_panes.insert(tmux_pane_id);
+        if shell_command.is_none() {
+            cc_global_insert_auto_exit(&ctx.workspace, tmux_pane_id);
+        }
         return format_new_pane(ctx, pane.pane_id(), fmt);
     }
 

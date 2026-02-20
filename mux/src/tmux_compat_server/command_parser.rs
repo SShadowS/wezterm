@@ -17,6 +17,7 @@ pub enum TmuxCliCommand {
         print_and_format: Option<String>,
         cwd: Option<String>,
         env: Vec<String>,
+        shell_command: Option<String>,
     },
     SendKeys {
         target: Option<String>,
@@ -52,6 +53,7 @@ pub enum TmuxCliCommand {
         print_and_format: Option<String>,
         cwd: Option<String>,
         env: Vec<String>,
+        shell_command: Option<String>,
     },
     SelectWindow {
         target: Option<String>,
@@ -112,6 +114,7 @@ pub enum TmuxCliCommand {
         print_and_format: Option<String>,
         cwd: Option<String>,
         env: Vec<String>,
+        shell_command: Option<String>,
     },
     ShowOptions {
         global: bool,
@@ -329,6 +332,7 @@ fn parse_split_window(args: &[String]) -> Result<TmuxCliCommand> {
     let mut format = None;
     let mut cwd = None;
     let mut env = Vec::new();
+    let mut shell_command = None;
 
     let expanded = expand_combined_flags(args, "hvPdbfZI");
     let strs: Vec<&str> = expanded.iter().map(|s| s.as_str()).collect();
@@ -345,7 +349,17 @@ fn parse_split_window(args: &[String]) -> Result<TmuxCliCommand> {
             "-d" | "-b" | "-f" | "-Z" | "-I" => {}
             "-e" => env.push(take_flag_value("-e", &mut iter)?),
             "-c" => cwd = Some(take_flag_value("-c", &mut iter)?),
-            other => bail!("split-window: unexpected argument: {other:?}"),
+            other if other.starts_with('-') => {
+                bail!("split-window: unexpected argument: {other:?}")
+            }
+            other => {
+                // Trailing positional argument(s) = shell command
+                let mut parts = vec![other.to_string()];
+                for rest in iter.by_ref() {
+                    parts.push(rest.to_string());
+                }
+                shell_command = Some(parts.join(" "));
+            }
         }
     }
 
@@ -363,6 +377,7 @@ fn parse_split_window(args: &[String]) -> Result<TmuxCliCommand> {
         print_and_format,
         cwd,
         env,
+        shell_command,
     })
 }
 
@@ -512,6 +527,7 @@ fn parse_new_window(args: &[String]) -> Result<TmuxCliCommand> {
     let mut format = None;
     let mut cwd = None;
     let mut env = Vec::new();
+    let mut shell_command = None;
 
     let expanded = expand_combined_flags(args, "PdSabk");
     let strs: Vec<&str> = expanded.iter().map(|s| s.as_str()).collect();
@@ -526,7 +542,17 @@ fn parse_new_window(args: &[String]) -> Result<TmuxCliCommand> {
             "-d" | "-S" | "-a" | "-b" | "-k" => {}
             "-e" => env.push(take_flag_value("-e", &mut iter)?),
             "-c" => cwd = Some(take_flag_value("-c", &mut iter)?),
-            other => bail!("new-window: unexpected argument: {other:?}"),
+            other if other.starts_with('-') => {
+                bail!("new-window: unexpected argument: {other:?}")
+            }
+            other => {
+                // Trailing positional argument(s) = shell command
+                let mut parts = vec![other.to_string()];
+                for rest in iter.by_ref() {
+                    parts.push(rest.to_string());
+                }
+                shell_command = Some(parts.join(" "));
+            }
         }
     }
 
@@ -542,6 +568,7 @@ fn parse_new_window(args: &[String]) -> Result<TmuxCliCommand> {
         print_and_format,
         cwd,
         env,
+        shell_command,
     })
 }
 
@@ -833,6 +860,7 @@ fn parse_new_session(args: &[String]) -> Result<TmuxCliCommand> {
     let mut format = None;
     let mut cwd = None;
     let mut env = Vec::new();
+    let mut shell_command = None;
 
     let expanded = expand_combined_flags(args, "PdADEX");
     let strs: Vec<&str> = expanded.iter().map(|s| s.as_str()).collect();
@@ -860,7 +888,17 @@ fn parse_new_session(args: &[String]) -> Result<TmuxCliCommand> {
             "-f" => {
                 let _ = take_flag_value("-f", &mut iter)?;
             }
-            other => bail!("new-session: unexpected argument: {other:?}"),
+            other if other.starts_with('-') => {
+                bail!("new-session: unexpected argument: {other:?}")
+            }
+            other => {
+                // Trailing positional argument(s) = shell command
+                let mut parts = vec![other.to_string()];
+                for rest in iter.by_ref() {
+                    parts.push(rest.to_string());
+                }
+                shell_command = Some(parts.join(" "));
+            }
         }
     }
 
@@ -877,6 +915,7 @@ fn parse_new_session(args: &[String]) -> Result<TmuxCliCommand> {
         print_and_format,
         cwd,
         env,
+        shell_command,
     })
 }
 
@@ -1437,6 +1476,7 @@ mod tests {
                 print_and_format: None,
                 cwd: None,
                 env: vec![],
+                shell_command: None,
             }
         );
     }
@@ -1453,6 +1493,7 @@ mod tests {
                 print_and_format: None,
                 cwd: None,
                 env: vec![],
+                shell_command: None,
             }
         );
     }
@@ -1469,6 +1510,7 @@ mod tests {
                 print_and_format: None,
                 cwd: None,
                 env: vec![],
+                shell_command: None,
             }
         );
     }
@@ -1485,6 +1527,7 @@ mod tests {
                 print_and_format: None,
                 cwd: None,
                 env: vec![],
+                shell_command: None,
             }
         );
     }
@@ -1701,6 +1744,7 @@ mod tests {
                 print_and_format: None,
                 cwd: None,
                 env: vec![],
+                shell_command: None,
             }
         );
     }
@@ -1715,6 +1759,7 @@ mod tests {
                 print_and_format: None,
                 cwd: None,
                 env: vec![],
+                shell_command: None,
             }
         );
     }
@@ -1729,6 +1774,7 @@ mod tests {
                 print_and_format: None,
                 cwd: None,
                 env: vec![],
+                shell_command: None,
             }
         );
     }
@@ -2270,6 +2316,7 @@ mod tests {
                 print_and_format: None,
                 cwd: None,
                 env: vec![],
+                shell_command: None,
             }
         );
     }
@@ -2285,6 +2332,7 @@ mod tests {
                 print_and_format: None,
                 cwd: None,
                 env: vec![],
+                shell_command: None,
             }
         );
     }
@@ -2300,6 +2348,7 @@ mod tests {
                 print_and_format: None,
                 cwd: None,
                 env: vec![],
+                shell_command: None,
             }
         );
     }
@@ -2755,6 +2804,7 @@ mod tests {
                 print_and_format: Some("#{pane_id}".into()),
                 cwd: None,
                 env: vec![],
+                shell_command: None,
             }
         );
     }
@@ -2771,6 +2821,7 @@ mod tests {
                 print_and_format: Some("#{session_name}:#{window_index}.#{pane_index}".into()),
                 cwd: None,
                 env: vec![],
+                shell_command: None,
             }
         );
     }
@@ -2788,6 +2839,7 @@ mod tests {
                 print_and_format: None,
                 cwd: Some("/tmp".into()),
                 env: vec!["FOO=bar".into()],
+                shell_command: None,
             }
         );
     }
@@ -2802,6 +2854,7 @@ mod tests {
                 print_and_format: Some("#{pane_id}".into()),
                 cwd: None,
                 env: vec![],
+                shell_command: None,
             }
         );
     }
@@ -2817,6 +2870,7 @@ mod tests {
                 print_and_format: Some("#{pane_id}".into()),
                 cwd: None,
                 env: vec![],
+                shell_command: None,
             }
         );
     }
@@ -3035,6 +3089,7 @@ mod tests {
                 print_and_format: None,
                 cwd: None,
                 env: vec![],
+                shell_command: None,
             }
         );
     }
@@ -3049,6 +3104,7 @@ mod tests {
                 print_and_format: None,
                 cwd: None,
                 env: vec![],
+                shell_command: None,
             }
         );
     }
@@ -3518,6 +3574,7 @@ mod tests {
                 print_and_format: None,
                 cwd: Some("/home/user/project".into()),
                 env: vec![],
+                shell_command: None,
             }
         );
     }
@@ -3532,6 +3589,7 @@ mod tests {
                 print_and_format: None,
                 cwd: Some("/tmp".into()),
                 env: vec![],
+                shell_command: None,
             }
         );
     }
@@ -3547,6 +3605,7 @@ mod tests {
                 print_and_format: None,
                 cwd: Some("/home/user".into()),
                 env: vec![],
+                shell_command: None,
             }
         );
     }
@@ -3565,6 +3624,7 @@ mod tests {
                 print_and_format: None,
                 cwd: None,
                 env: vec!["CLAUDECODE=1".into(), "TERM=xterm".into()],
+                shell_command: None,
             }
         );
     }
@@ -3579,6 +3639,7 @@ mod tests {
                 print_and_format: None,
                 cwd: None,
                 env: vec!["FOO=bar".into()],
+                shell_command: None,
             }
         );
     }
@@ -3596,6 +3657,7 @@ mod tests {
                 print_and_format: Some("#{pane_id}".into()),
                 cwd: Some("/tmp".into()),
                 env: vec!["KEY=val".into()],
+                shell_command: None,
             }
         );
     }
@@ -3657,6 +3719,7 @@ mod tests {
                 print_and_format: Some("#{pane_id}".into()),
                 cwd: None,
                 env: vec![],
+                shell_command: None,
             }
         );
     }
@@ -3673,6 +3736,7 @@ mod tests {
                 print_and_format: Some("#{pane_id}".into()),
                 cwd: None,
                 env: vec![],
+                shell_command: None,
             }
         );
     }
@@ -3687,6 +3751,7 @@ mod tests {
                 print_and_format: Some("#{pane_id}".into()),
                 cwd: None,
                 env: vec![],
+                shell_command: None,
             }
         );
     }
@@ -3702,6 +3767,7 @@ mod tests {
                 print_and_format: Some("#{pane_id}".into()),
                 cwd: None,
                 env: vec![],
+                shell_command: None,
             }
         );
     }
@@ -3711,5 +3777,92 @@ mod tests {
         // -tP contains 't' which takes a value, so it should NOT be expanded
         // and should fail as an unknown arg
         assert!(parse_command("split-window -tP").is_err());
+    }
+
+    // ---------------------------------------------------------------
+    // Shell command positional argument tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn split_window_shell_command() {
+        assert_eq!(
+            parse("split-window -h 'echo hello'"),
+            TmuxCliCommand::SplitWindow {
+                horizontal: true,
+                vertical: false,
+                target: None,
+                size: None,
+                print_and_format: None,
+                cwd: None,
+                env: vec![],
+                shell_command: Some("echo hello".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn split_window_shell_command_with_flags() {
+        assert_eq!(
+            parse("split-window -h -P -F '#{pane_id}' 'my-command --flag'"),
+            TmuxCliCommand::SplitWindow {
+                horizontal: true,
+                vertical: false,
+                target: None,
+                size: None,
+                print_and_format: Some("#{pane_id}".into()),
+                cwd: None,
+                env: vec![],
+                shell_command: Some("my-command --flag".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn new_window_shell_command() {
+        assert_eq!(
+            parse("new-window 'ls -la'"),
+            TmuxCliCommand::NewWindow {
+                target: None,
+                name: None,
+                print_and_format: None,
+                cwd: None,
+                env: vec![],
+                shell_command: Some("ls -la".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn new_session_shell_command() {
+        assert_eq!(
+            parse("new-session -s work -d 'vim /tmp/test.txt'"),
+            TmuxCliCommand::NewSession {
+                name: Some("work".into()),
+                window_name: None,
+                detached: true,
+                print_and_format: None,
+                cwd: None,
+                env: vec![],
+                shell_command: Some("vim /tmp/test.txt".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn split_window_no_shell_command() {
+        // Ensure no shell_command when only flags are provided
+        assert_eq!(
+            parse("split-window -h"),
+            TmuxCliCommand::SplitWindow {
+                horizontal: true,
+                vertical: false,
+                target: None,
+                size: None,
+                print_and_format: None,
+                cwd: None,
+                env: vec![],
+                shell_command: None,
+            }
+        );
     }
 }
