@@ -895,9 +895,15 @@ impl Tab {
         request: SplitRequest,
         pane: Arc<dyn Pane>,
     ) -> anyhow::Result<usize> {
-        self.inner
+        let result = self
+            .inner
             .lock()
-            .split_and_insert(pane_index, request, pane)
+            .split_and_insert(pane_index, request, pane);
+        // Notify the GUI so it recalculates layout and resizes panes to
+        // match the new split geometry. Without this, the original pane's
+        // visual width can be stale until the user manually moves a divider.
+        Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.tab_id)));
+        result
     }
 
     pub fn get_zoomed_pane(&self) -> Option<Arc<dyn Pane>> {
