@@ -68,5 +68,21 @@ try {
     Write-Host "  FAILED to copy env.exe" -ForegroundColor Red
 }
 
+# Ensure Start Menu shortcut points directly to wezterm-gui.exe (no launcher needed)
+$ShortcutPath = "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\WezTerm.lnk"
+if (Test-Path $ShortcutPath) {
+    $Shell = New-Object -ComObject WScript.Shell
+    $Shortcut = $Shell.CreateShortcut($ShortcutPath)
+    $DesiredTarget = "$InstallDir\wezterm-gui.exe"
+    if ($Shortcut.TargetPath -ne $DesiredTarget) {
+        Write-Host ""
+        Write-Host "=== Updating Start Menu shortcut ===" -ForegroundColor Cyan
+        $Shortcut.TargetPath = $DesiredTarget
+        $Shortcut.WorkingDirectory = $InstallDir
+        $Shortcut.Save()
+        Write-Host "  Shortcut now points to wezterm-gui.exe" -ForegroundColor Green
+    }
+}
+
 Write-Host ""
 Write-Host "=== Done ($ProfileLabel) ===" -ForegroundColor Cyan

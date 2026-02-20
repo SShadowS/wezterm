@@ -114,11 +114,13 @@ cargo build --release -p env-shim
 
 For upstream installation and platform-specific instructions, see the [WezTerm installation docs](https://wezterm.org/installation).
 
-### Tmux-Compat Shim Setup
+### Claude Code Setup
 
-Place the built `tmux` shim binary on your `PATH` (before any real tmux, if installed). Claude Code agents will then use standard `tmux` commands that automatically route through WezTerm's CC protocol server.
+1. **Build and deploy** — run `build-and-deploy.ps1` (or manually place the `tmux.exe` and `env.exe` shim binaries in a `tmux-compat/` subdirectory next to `wezterm-gui.exe`)
+2. **Enable tmux compat** — add `config.enable_tmux_compat = true` to your `.wezterm.lua`
+3. **Launch WezTerm normally** — no special shortcut or launcher needed
 
-> 💡 **Tip:** The shim reads the `WEZTERM_TMUX_CC` environment variable for the socket path. Make sure this is set in your shell profile for seamless agent integration.
+That's it. When `enable_tmux_compat` is enabled, every spawned shell automatically gets `WEZTERM_TMUX_CC`, `TMUX`, and `PATH` (with the `tmux-compat/` shim directory prepended) configured by WezTerm. Claude Code agents will find the `tmux` shim on PATH and route commands through WezTerm's CC protocol server.
 
 ---
 
@@ -128,6 +130,9 @@ Fork-specific options in your `.wezterm.lua`:
 
 ```lua
 local config = wezterm.config_builder()
+
+-- Enable tmux CC protocol server for Claude Code agent teams
+config.enable_tmux_compat = true
 
 -- Per-pane header colors
 config.pane_header_active_fg_color = "#ffffff"
