@@ -2275,6 +2275,12 @@ impl TabInner {
                 } else {
                     self.resize(split_info.second.clone());
                 }
+                // Restore the tab's true size; the resize above only
+                // adjusts existing pane geometry to make room for the
+                // new split — it must not shrink the tab's logical size,
+                // otherwise subsequent splits compute from a too-small
+                // base and panes become progressively narrower.
+                self.size = tab_size;
             }
 
             let mut cursor = self.pane.take().unwrap().cursor();
