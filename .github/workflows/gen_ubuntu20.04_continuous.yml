@@ -100,11 +100,9 @@ jobs:
       - name: "Build strip-ansi-escapes (Release mode)"
         shell: bash
         run: "cargo build -p strip-ansi-escapes --release"
-      - name: "Install cargo-nextest from Cargo"
-        uses: baptiste0928/cargo-install@v3
-        with:
-          crate: "cargo-nextest"
-          cache-key: "ubuntu20.04"
+      - name: "Install cargo-nextest"
+        shell: bash
+        run: "curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C /usr/local/bin"
       - name: "Test"
         shell: bash
         run: "cargo nextest run --all --no-fail-fast"
