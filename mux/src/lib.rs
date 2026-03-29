@@ -162,6 +162,7 @@ pub struct Mux {
     tabs: RwLock<HashMap<TabId, Arc<Tab>>>,
     panes: RwLock<HashMap<PaneId, Arc<dyn Pane>>>,
     windows: RwLock<HashMap<WindowId, Window>>,
+    tab_to_window: RwLock<HashMap<TabId, WindowId>>,
     default_domain: RwLock<Option<Arc<dyn Domain>>>,
     domains: RwLock<HashMap<DomainId, Arc<dyn Domain>>>,
     domains_by_name: RwLock<HashMap<String, Arc<dyn Domain>>>,
@@ -502,6 +503,7 @@ impl Mux {
             tabs: RwLock::new(HashMap::new()),
             panes: RwLock::new(HashMap::new()),
             windows: RwLock::new(HashMap::new()),
+            tab_to_window: RwLock::new(HashMap::new()),
             default_domain: RwLock::new(default_domain),
             domains_by_name: RwLock::new(domains_by_name),
             domains: RwLock::new(domains),
@@ -892,6 +894,7 @@ impl Mux {
         log::debug!("remove_tab_internal tab {}", tab_id);
 
         let tab = self.tabs.write().remove(&tab_id)?;
+        self.tab_to_window.write().remove(&tab_id);
 
         self.notify(MuxNotification::TabRemoved(tab_id));
 
@@ -1066,20 +1069,14 @@ impl Mux {
                 .ok_or_else(|| anyhow!("add_tab_to_window: no such window_id {}", window_id))?;
             window.push(tab);
         }
+        self.tab_to_window.write().insert(tab_id, window_id);
         self.recompute_pane_count();
         self.notify(MuxNotification::TabAddedToWindow { tab_id, window_id });
         Ok(())
     }
 
     pub fn window_containing_tab(&self, tab_id: TabId) -> Option<WindowId> {
-        for w in self.windows.read().values() {
-            for t in w.iter() {
-                if t.tab_id() == tab_id {
-                    return Some(w.window_id());
-                }
-            }
-        }
-        None
+        self.tab_to_window.read().get(&tab_id).copied()
     }
 
     pub fn is_empty(&self) -> bool {
