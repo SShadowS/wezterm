@@ -84,6 +84,7 @@ pub enum MuxNotification {
     },
     PaneFocused(PaneId),
     TabResized(TabId),
+    TabRemoved(TabId),
     TabTitleChanged {
         tab_id: TabId,
         title: String,
@@ -119,7 +120,7 @@ static OUTPUT_TAPS: Mutex<
 /// Returns a receiver that will get `(raw_bytes, timestamp)` for every chunk
 /// of PTY output.
 pub fn register_output_tap(pane_id: PaneId) -> std::sync::mpsc::Receiver<(Vec<u8>, Instant)> {
-    let (tx, rx) = std::sync::mpsc::sync_channel(256);
+    let (tx, rx) = std::sync::mpsc::sync_channel(4096);
     let mut guard = OUTPUT_TAPS.lock();
     let map = guard.get_or_insert_with(HashMap::new);
     map.entry(pane_id).or_default().push(tx);
@@ -141,7 +142,15 @@ fn notify_output_taps(pane_id: PaneId, data: &[u8], when: Instant) {
     let mut guard = OUTPUT_TAPS.lock();
     if let Some(map) = guard.as_mut() {
         if let Some(senders) = map.get_mut(&pane_id) {
+            let before = senders.len();
             senders.retain(|tx| tx.try_send((data.to_vec(), when)).is_ok());
+            let dropped = before - senders.len();
+            if dropped > 0 {
+                log::warn!(
+                    "output tap: dropped {dropped} tap(s) for pane {pane_id} \
+                     (channel full or disconnected)"
+                );
+            }
             if senders.is_empty() {
                 map.remove(&pane_id);
             }
@@ -883,6 +892,8 @@ impl Mux {
         log::debug!("remove_tab_internal tab {}", tab_id);
 
         let tab = self.tabs.write().remove(&tab_id)?;
+
+        self.notify(MuxNotification::TabRemoved(tab_id));
 
         if let Some(mut windows) = self.windows.try_write() {
             for w in windows.values_mut() {

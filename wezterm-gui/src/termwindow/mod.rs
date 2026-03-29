@@ -1316,6 +1316,9 @@ impl TermWindow {
                     self.pane_state.borrow_mut().remove(&pane_id);
                     self.semantic_zones.remove(&pane_id);
                 }
+                MuxNotification::TabRemoved(tab_id) => {
+                    self.tab_state.borrow_mut().remove(&tab_id);
+                }
                 MuxNotification::PaneAdded(_)
                 | MuxNotification::WorkspaceRenamed { .. }
                 | MuxNotification::WindowWorkspaceChanged(_)
@@ -1512,6 +1515,10 @@ impl TermWindow {
                 // Set the window as dead to unsubscribe from further notifications
                 dead.store(true, Ordering::Relaxed);
                 return false;
+            }
+            MuxNotification::TabRemoved(_) => {
+                // Always forward — the tab is already removed from the mux,
+                // so window_containing_tab can't check ownership.
             }
             MuxNotification::TabResized(tab_id)
             | MuxNotification::TabTitleChanged { tab_id, .. } => {

@@ -390,6 +390,7 @@ pub fn translate_notification(
         // Notifications with no CC equivalent — silently ignore.
         MuxNotification::PaneOutput(_)
         | MuxNotification::PaneAdded(_)
+        | MuxNotification::TabRemoved(_)
         | MuxNotification::WindowWorkspaceChanged(_)
         | MuxNotification::ActiveWorkspaceChanged(_)
         | MuxNotification::Alert { .. }
@@ -485,14 +486,41 @@ fn drain_output_taps(
     Ok(())
 }
 
+/// The inner loop for a per-pane output forwarder thread.
+///
+/// Reads from `tap_rx` and forwards to `agg_tx`.  Exits when:
+/// - `shutdown` flag is set (checked after each recv)
+/// - `agg_tx.send()` fails (aggregator dropped)
+/// - `tap_rx` is disconnected (tap removed)
+fn output_forwarder_loop(
+    pane_id: crate::pane::PaneId,
+    tap_rx: std::sync::mpsc::Receiver<(Vec<u8>, Instant)>,
+    agg_tx: std::sync::mpsc::SyncSender<(crate::pane::PaneId, Vec<u8>, Instant)>,
+    shutdown: &std::sync::atomic::AtomicBool,
+) {
+    while let Ok((data, when)) = tap_rx.recv() {
+        if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+        if agg_tx.send((pane_id, data, when)).is_err() {
+            break;
+        }
+    }
+}
+
 /// Register output taps for all panes in the workspace and start a forwarder
 /// thread that reads raw output from taps and sends it to a unified channel.
 ///
-/// Returns a receiver for `(wezterm_pane_id, data, timestamp)`.
+/// Returns the output receiver and a shutdown flag.  Setting the flag to `true`
+/// causes all forwarder threads to exit after their next recv.
 fn start_output_forwarder(
     workspace: &str,
-) -> std::sync::mpsc::Receiver<(crate::pane::PaneId, Vec<u8>, Instant)> {
+) -> (
+    std::sync::mpsc::Receiver<(crate::pane::PaneId, Vec<u8>, Instant)>,
+    Arc<std::sync::atomic::AtomicBool>,
+) {
     let (tx, rx) = std::sync::mpsc::sync_channel(1024);
+    let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // Register taps for all existing panes.
     if let Some(mux) = Mux::try_get() {
@@ -504,14 +532,11 @@ fn start_output_forwarder(
                         let pane_id = pp.pane.pane_id();
                         let tap_rx = crate::register_output_tap(pane_id);
                         let tx2 = tx.clone();
+                        let shutdown2 = shutdown.clone();
                         std::thread::Builder::new()
                             .name(format!("cc-output-tap-{}", pane_id))
                             .spawn(move || {
-                                for (data, when) in tap_rx {
-                                    if tx2.send((pane_id, data, when)).is_err() {
-                                        break; // Connection closed.
-                                    }
-                                }
+                                output_forwarder_loop(pane_id, tap_rx, tx2, &shutdown2);
                             })
                             .ok();
                     }
@@ -520,7 +545,7 @@ fn start_output_forwarder(
         }
     }
 
-    rx
+    (rx, shutdown)
 }
 
 fn process_cc_connection_sync(
@@ -543,7 +568,16 @@ fn process_cc_connection_sync(
     log::info!("tmux CC: handshake sent ({} bytes)", handshake.len());
 
     // Start output forwarder for all panes in the workspace.
-    let output_rx = start_output_forwarder(&workspace);
+    let (output_rx, forwarder_shutdown) = start_output_forwarder(&workspace);
+
+    // Guard that signals forwarder threads to exit when this function returns.
+    struct ShutdownGuard(Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for ShutdownGuard {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let _shutdown_guard = ShutdownGuard(forwarder_shutdown);
 
     // Manual line-buffered read loop.  We avoid BufReader because we need
     // to alternate reads and writes on the same stream, and writes through
@@ -785,6 +819,7 @@ fn start_tmux_compat_listener_uds(socket_path: &std::path::Path) -> anyhow::Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     // --- extract_lines tests ---
 
@@ -1093,5 +1128,55 @@ mod tests {
         let session = TmuxCompatSession::new("test".to_string());
         assert!(session.ctx.last_active_tab.is_empty());
         assert_eq!(session.ctx.suppress_window_changed, 0);
+    }
+
+    // --- Output forwarder shutdown tests ---
+
+    #[test]
+    fn forwarder_shutdown_flag_stops_threads() {
+        // Create a channel simulating a pane tap.
+        let (tap_tx, tap_rx) = std::sync::mpsc::sync_channel::<(Vec<u8>, Instant)>(16);
+        let (agg_tx, agg_rx) = std::sync::mpsc::sync_channel(64);
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let shutdown2 = shutdown.clone();
+        let handle = std::thread::spawn(move || {
+            output_forwarder_loop(42, tap_rx, agg_tx, &shutdown2);
+        });
+
+        // Send some data — should be forwarded.
+        tap_tx
+            .send((b"hello".to_vec(), Instant::now()))
+            .unwrap();
+        let (pid, data, _ts) = agg_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(pid, 42);
+        assert_eq!(data, b"hello");
+
+        // Signal shutdown — thread should exit even though tap channel is open.
+        shutdown.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        // Send another message to unblock the thread from recv.
+        let _ = tap_tx.send((b"wake".to_vec(), Instant::now()));
+
+        handle.join().expect("forwarder thread should exit cleanly");
+    }
+
+    #[test]
+    fn forwarder_exits_when_aggregator_closed() {
+        let (tap_tx, tap_rx) = std::sync::mpsc::sync_channel::<(Vec<u8>, Instant)>(16);
+        let (agg_tx, agg_rx) = std::sync::mpsc::sync_channel(64);
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let handle = std::thread::spawn(move || {
+            output_forwarder_loop(1, tap_rx, agg_tx, &shutdown);
+        });
+
+        // Drop the aggregator receiver — forwarder should exit on send error.
+        drop(agg_rx);
+        tap_tx
+            .send((b"data".to_vec(), Instant::now()))
+            .unwrap();
+
+        handle.join().expect("forwarder thread should exit on send error");
     }
 }
