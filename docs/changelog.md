@@ -257,6 +257,18 @@ As features stabilize some brief notes about them will accumulate here.
 * macOS: Fix toast notifications. Thanks to @nikhilm! #7483
 * termwiz: Fixed parsing of fragmented mouse reporting sequence. Thanks to
   @jgiannuzzi! #7076 #7504
+* Windows: Fixed a crash (RefCell borrow conflict) when toggling IME (e.g.
+  pressing Hankaku/Zenkaku) after splitting a pane. Thanks to @shiena! #7529
+* Fixed a stack overflow that could occur on Windows (and other platforms) when
+  the process tree contained cycles due to PID reuse. Thanks to @novoselov-ab! #7706
+* Fixed an infinite loop in pane search when the regex engine hit a backtracking
+  limit. Thanks to @bew! #7864
+* Fix ESC key encoding in kitty mode with disambiguate flag enabled.
+  Thanks to @Felixoid and @the-mikedavis! #7787
+* Fixed two divide-by-zero crashes in Kitty inline image placement when a program requests
+  a zero-sized placement (e.g. `w=0`/`h=0`), or displaying a cell-sized image on a pane
+  whose pty reported no pixel dimensions (e.g. in `tmux -CC` domain).
+  Such images are now refused instead of taking down the pane. Thanks to @zakrad! #6344
 
 #### Updated
 * Bundled conpty.dll and OpenConsole.exe to build 1.22.250204002.nupkg
