@@ -8,18 +8,30 @@ use window::{Clipboard, WindowOps};
 
 impl TermWindow {
     pub fn copy_to_clipboard(&self, clipboard: ClipboardCopyDestination, text: String) {
-        let clipboard = match clipboard {
-            ClipboardCopyDestination::Clipboard => [Some(Clipboard::Clipboard), None],
-            ClipboardCopyDestination::PrimarySelection => [Some(Clipboard::PrimarySelection), None],
-            ClipboardCopyDestination::ClipboardAndPrimarySelection => [
-                Some(Clipboard::Clipboard),
-                Some(Clipboard::PrimarySelection),
-            ],
-        };
-        for &c in &clipboard {
-            if let Some(c) = c {
-                self.window.as_ref().unwrap().set_clipboard(c, text.clone());
+        // Build the list of physical clipboard targets to write. On platforms
+        // with a real primary selection (X11/Wayland) Clipboard and
+        // PrimarySelection are distinct destinations. On Windows there is only
+        // one system clipboard, so ClipboardAndPrimarySelection must not write
+        // it twice: clipboard-win empties the clipboard on each open, and the
+        // second open/empty/set cycle can race a clipboard-history listener and
+        // leave the clipboard blank (symptom: a real entry followed by an empty
+        // one, with the empty one winning on paste).
+        let targets: Vec<Clipboard> = match clipboard {
+            ClipboardCopyDestination::Clipboard => vec![Clipboard::Clipboard],
+            ClipboardCopyDestination::PrimarySelection => vec![Clipboard::PrimarySelection],
+            ClipboardCopyDestination::ClipboardAndPrimarySelection => {
+                #[cfg(windows)]
+                {
+                    vec![Clipboard::Clipboard]
+                }
+                #[cfg(not(windows))]
+                {
+                    vec![Clipboard::Clipboard, Clipboard::PrimarySelection]
+                }
             }
+        };
+        for c in targets {
+            self.window.as_ref().unwrap().set_clipboard(c, text.clone());
         }
     }
 
