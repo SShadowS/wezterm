@@ -45,6 +45,9 @@ struct TabInner {
     active: usize,
     zoomed: Option<Arc<dyn Pane>>,
     title: String,
+    /// User-set title via CLI or API. When Some, overrides the escape-sequence title.
+    /// Cleared by setting to empty string via `set_user_title("")`.
+    user_title: Option<String>,
     recency: Recency,
 }
 
@@ -662,19 +665,52 @@ impl Tab {
     }
 
     pub fn get_title(&self) -> String {
-        self.inner.lock().title.clone()
+        let inner = self.inner.lock();
+        if let Some(ref user_title) = inner.user_title {
+            user_title.clone()
+        } else {
+            inner.title.clone()
+        }
     }
 
+    /// Set a user-initiated title (from CLI or API) that overrides
+    /// escape-sequence titles. Setting to empty clears the override.
+    pub fn set_user_title(&self, title: &str) {
+        let mut inner = self.inner.lock();
+        let new_user_title = if title.is_empty() { None } else { Some(title.to_string()) };
+        let effective_changed = inner.user_title != new_user_title;
+        inner.user_title = new_user_title;
+        if effective_changed {
+            let effective_title = if let Some(ref ut) = inner.user_title {
+                ut.clone()
+            } else {
+                inner.title.clone()
+            };
+            Mux::try_get().map(|mux| {
+                mux.notify(MuxNotification::TabTitleChanged {
+                    tab_id: inner.id,
+                    title: effective_title,
+                })
+            });
+        }
+    }
+
+    /// Set the title from escape sequences. If a user_title override is active,
+    /// the underlying title is still updated but no notification is fired
+    /// (since the effective title hasn't changed).
     pub fn set_title(&self, title: &str) {
         let mut inner = self.inner.lock();
         if inner.title != title {
             inner.title = title.to_string();
-            Mux::try_get().map(|mux| {
-                mux.notify(MuxNotification::TabTitleChanged {
-                    tab_id: inner.id,
-                    title: title.to_string(),
-                })
-            });
+            // Only notify if no user override is active
+            if inner.user_title.is_none() {
+                Mux::try_get().map(|mux| {
+                    mux.notify(MuxNotification::TabTitleChanged {
+                        tab_id: inner.id,
+                        title: title.to_string(),
+                    })
+                });
+            }
         }
     }
 
@@ -921,6 +957,7 @@ impl TabInner {
             active: 0,
             zoomed: None,
             title: String::new(),
+            user_title: None,
             recency: Recency::default(),
         }
     }

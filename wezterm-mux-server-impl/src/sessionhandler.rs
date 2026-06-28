@@ -906,7 +906,7 @@ impl SessionHandler {
                                 .get_tab(tab_id)
                                 .ok_or_else(|| anyhow!("no such tab {tab_id}"))?;
 
-                            tab.set_title(&title);
+                            tab.set_user_title(&title);
 
                             Ok(Pdu::UnitResponse(UnitResponse {}))
                         },
