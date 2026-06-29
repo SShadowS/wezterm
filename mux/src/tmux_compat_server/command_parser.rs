@@ -309,9 +309,7 @@ fn take_flag_value<'a>(flag: &str, iter: &mut impl Iterator<Item = &'a str>) -> 
 fn expand_combined_flags(args: &[String], bool_flags: &str) -> Vec<String> {
     let mut out = Vec::with_capacity(args.len());
     for arg in args {
-        if arg.starts_with('-')
-            && arg.len() > 2
-            && arg[1..].chars().all(|c| bool_flags.contains(c))
+        if arg.starts_with('-') && arg.len() > 2 && arg[1..].chars().all(|c| bool_flags.contains(c))
         {
             for ch in arg[1..].chars() {
                 out.push(format!("-{ch}"));

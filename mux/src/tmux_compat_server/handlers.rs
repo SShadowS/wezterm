@@ -297,7 +297,6 @@ pub struct HandlerContext {
     /// These are preferred over the terminal's own title (which the shell can
     /// override via OSC 2) when expanding `#{pane_title}`.
     pub pane_titles: HashMap<PaneId, String>,
-
 }
 
 impl HandlerContext {
@@ -647,9 +646,7 @@ pub fn build_format_context(
         ctx.pane_titles,
         pp.pane.get_title()
     );
-    let pane_title = stored_title
-        .cloned()
-        .unwrap_or_else(|| pp.pane.get_title());
+    let pane_title = stored_title.cloned().unwrap_or_else(|| pp.pane.get_title());
     let pane_current_command = pp
         .pane
         .get_foreground_process_name(CachePolicy::AllowStale)

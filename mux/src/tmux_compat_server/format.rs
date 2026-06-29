@@ -1095,22 +1095,13 @@ mod tests {
 
     #[test]
     fn style_hex_color() {
-        assert_eq!(
-            tmux_style_to_ansi("#[fg=#ff0000]"),
-            "\x1b[38;2;255;0;0m"
-        );
-        assert_eq!(
-            tmux_style_to_ansi("#[bg=#00ff00]"),
-            "\x1b[48;2;0;255;0m"
-        );
+        assert_eq!(tmux_style_to_ansi("#[fg=#ff0000]"), "\x1b[38;2;255;0;0m");
+        assert_eq!(tmux_style_to_ansi("#[bg=#00ff00]"), "\x1b[48;2;0;255;0m");
     }
 
     #[test]
     fn style_passthrough_text() {
-        assert_eq!(
-            tmux_style_to_ansi("hello world"),
-            "hello world"
-        );
+        assert_eq!(tmux_style_to_ansi("hello world"), "hello world");
     }
 
     #[test]
@@ -1122,22 +1113,13 @@ mod tests {
 
     #[test]
     fn style_bright_colors() {
-        assert_eq!(
-            tmux_style_to_ansi("#[fg=brightred]"),
-            "\x1b[38;5;9m"
-        );
-        assert_eq!(
-            tmux_style_to_ansi("#[fg=brightwhite]"),
-            "\x1b[38;5;15m"
-        );
+        assert_eq!(tmux_style_to_ansi("#[fg=brightred]"), "\x1b[38;5;9m");
+        assert_eq!(tmux_style_to_ansi("#[fg=brightwhite]"), "\x1b[38;5;15m");
     }
 
     #[test]
     fn style_multiple_simple_attrs() {
-        assert_eq!(
-            tmux_style_to_ansi("#[bold,italic]"),
-            "\x1b[1;3m"
-        );
+        assert_eq!(tmux_style_to_ansi("#[bold,italic]"), "\x1b[1;3m");
     }
 
     #[test]

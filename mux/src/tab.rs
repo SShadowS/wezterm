@@ -677,7 +677,11 @@ impl Tab {
     /// escape-sequence titles. Setting to empty clears the override.
     pub fn set_user_title(&self, title: &str) {
         let mut inner = self.inner.lock();
-        let new_user_title = if title.is_empty() { None } else { Some(title.to_string()) };
+        let new_user_title = if title.is_empty() {
+            None
+        } else {
+            Some(title.to_string())
+        };
         let effective_changed = inner.user_title != new_user_title;
         inner.user_title = new_user_title;
         if effective_changed {

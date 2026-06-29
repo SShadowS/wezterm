@@ -111,9 +111,7 @@ impl crate::TermWindow {
 
         let element = Element::new(&font, ElementContent::Text(label))
             .colors(ElementColors {
-                border: BorderColor::new(
-                    self.config.pane_select_bg_color.to_linear().into(),
-                ),
+                border: BorderColor::new(self.config.pane_select_bg_color.to_linear().into()),
                 bg: self.config.pane_select_bg_color.to_linear().into(),
                 text: self.config.pane_select_fg_color.to_linear().into(),
             })
@@ -163,9 +161,7 @@ impl crate::TermWindow {
         let center_x = padding_left
             + border.left.get() as f32
             + match split.direction {
-                SplitDirection::Horizontal => {
-                    (split.left as f32 + 0.5) * cell_width
-                }
+                SplitDirection::Horizontal => (split.left as f32 + 0.5) * cell_width,
                 SplitDirection::Vertical => {
                     (split.left as f32 + split.size as f32 / 2.0) * cell_width
                 }
@@ -176,9 +172,7 @@ impl crate::TermWindow {
                 SplitDirection::Horizontal => {
                     (split.top as f32 + split.size as f32 / 2.0) * cell_height
                 }
-                SplitDirection::Vertical => {
-                    (split.top as f32 + 0.5) * cell_height
-                }
+                SplitDirection::Vertical => (split.top as f32 + 0.5) * cell_height,
             };
 
         let mut computed = self.compute_element(
@@ -204,10 +198,7 @@ impl crate::TermWindow {
         // Translate so the element is centered on the divider
         let element_width = computed.bounds.width();
         let element_height = computed.bounds.height();
-        computed.translate(euclid::vec2(
-            -element_width / 2.0,
-            -element_height / 2.0,
-        ));
+        computed.translate(euclid::vec2(-element_width / 2.0, -element_height / 2.0));
 
         let gl_state = self.render_state.as_ref().unwrap();
         self.render_element(&computed, gl_state, None)?;

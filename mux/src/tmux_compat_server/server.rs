@@ -1145,9 +1145,7 @@ mod tests {
         });
 
         // Send some data — should be forwarded.
-        tap_tx
-            .send((b"hello".to_vec(), Instant::now()))
-            .unwrap();
+        tap_tx.send((b"hello".to_vec(), Instant::now())).unwrap();
         let (pid, data, _ts) = agg_rx.recv_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(pid, 42);
         assert_eq!(data, b"hello");
@@ -1173,10 +1171,10 @@ mod tests {
 
         // Drop the aggregator receiver — forwarder should exit on send error.
         drop(agg_rx);
-        tap_tx
-            .send((b"data".to_vec(), Instant::now()))
-            .unwrap();
+        tap_tx.send((b"data".to_vec(), Instant::now())).unwrap();
 
-        handle.join().expect("forwarder thread should exit on send error");
+        handle
+            .join()
+            .expect("forwarder thread should exit on send error");
     }
 }
