@@ -21,6 +21,9 @@ jobs:
   lints:
     name: Build
     runs-on: ubuntu-latest
+    # Skip on forks: the Nix build relies on DeterminateSystems FlakeHub /
+    # Magic Nix Cache, which requires an account this fork does not have.
+    if: github.repository == 'wezterm/wezterm'
     steps:
       - uses: actions/checkout@v3
       - name: Install nix
